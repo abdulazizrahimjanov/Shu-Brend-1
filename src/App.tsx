@@ -98,11 +98,19 @@ export default function App() {
     init();
     const onOnline = () => setOnline(true);
     const onOffline = () => setOnline(false);
+    let resumeTimer: number | undefined;
     const onResume = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       const st = useAppStore.getState();
-      if (navigator.onLine && (st.cloudError || (st.db?.offlineQueue.length ?? 0) > 0 || st.cloudConnected)) {
-        void st.checkAndSyncNow();
+      if (!navigator.onLine) return;
+      if (st.cloudError || (st.db?.offlineQueue.length ?? 0) > 0) {
+        window.clearTimeout(resumeTimer);
+        resumeTimer = window.setTimeout(() => {
+          const latest = useAppStore.getState();
+          if (navigator.onLine && (latest.cloudError || (latest.db?.offlineQueue.length ?? 0) > 0)) {
+            void latest.checkAndSyncNow();
+          }
+        }, 1200);
       }
     };
 
@@ -123,6 +131,7 @@ export default function App() {
     window.addEventListener('focus', onResume);
     document.addEventListener('visibilitychange', onResume);
     return () => {
+      window.clearTimeout(resumeTimer);
       window.clearInterval(syncInterval);
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);

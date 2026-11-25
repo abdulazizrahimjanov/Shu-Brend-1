@@ -29,9 +29,11 @@ import {
   callFirebaseFunction,
   createEmployeeAuthSecondary,
   createPrimaryOwnerAuth,
+  ensureFirestoreNetwork,
   firestoreDb,
   formatFirebaseErrorMessage,
   handleFirestoreError,
+  isTransientFirestoreError,
   isValidUsername,
   normalizeUsername,
   OperationType,
@@ -2956,15 +2958,35 @@ export async function checkWorkspaceSyncHealth(
       error: lang === 'ru' ? 'Нет подключения к интернету' : "Internet aloqasi yo'q",
     };
   }
-  try {
-    await getDocFromServer(doc(firestoreDb, 'workspaces', ctx.workspaceId));
-    return { ok: true };
-  } catch (err) {
-    return {
-      ok: false,
-      error: formatFirebaseErrorMessage(err, lang),
-    };
+  const runCheck = async () => {
+    await ensureFirestoreNetwork();
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('firestore-health-timeout')), 12000);
+    });
+    await Promise.race([
+      getDocFromServer(doc(firestoreDb, 'workspaces', ctx.workspaceId)),
+      timeout,
+    ]);
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await runCheck();
+      return { ok: true };
+    } catch (err) {
+      if (attempt === 0 && isTransientFirestoreError(err)) {
+        await new Promise((r) => setTimeout(r, 1200));
+        continue;
+      }
+      return {
+        ok: false,
+        error: isTransientFirestoreError(err)
+          ? formatFirebaseErrorMessage(new Error('unavailable'), lang)
+          : formatFirebaseErrorMessage(err, lang),
+      };
+    }
   }
+  return { ok: true };
 }
 
 const WORKSPACE_WIDE_READ_COLS = new Set([
@@ -3237,6 +3259,11 @@ export function subscribeWorkspaceRealtime(
         scheduleFlush();
       },
       (err) => {
+        if (isTransientFirestoreError(err)) {
+          void ensureFirestoreNetwork();
+          console.warn('[firebaseSync] Transient listener reconnect on workspace root:', err);
+          return;
+        }
         try {
           handleFirestoreError(err, OperationType.GET, wsPath);
         } catch (wrapped) {
@@ -3275,6 +3302,11 @@ export function subscribeWorkspaceRealtime(
         }
       },
       (err) => {
+        if (isTransientFirestoreError(err)) {
+          void ensureFirestoreNetwork();
+          console.warn('[firebaseSync] Transient listener reconnect on member doc:', err);
+          return;
+        }
         try {
           handleFirestoreError(err, OperationType.GET, `${wsPath}/members/${ctx.uid}`);
         } catch (wrapped) {
@@ -3409,6 +3441,12 @@ export function subscribeWorkspaceRealtime(
               if (onSyncWarning) {
                 onSyncWarning(err instanceof Error ? err : new Error(String(err)));
               }
+              return;
+            }
+
+            if (isTransientFirestoreError(err)) {
+              void ensureFirestoreNetwork();
+              console.warn(`[firebaseSync] Transient listener reconnect on ${colPath}:`, err);
               return;
             }
 
@@ -3547,6 +3585,11 @@ export function subscribeWorkspaceRealtime(
           scheduleFlush();
         },
         (err) => {
+          if (isTransientFirestoreError(err)) {
+            void ensureFirestoreNetwork();
+            console.warn('[firebaseSync] Transient listener reconnect on privateSettings:', err);
+            return;
+          }
           try {
             handleFirestoreError(err, OperationType.GET, `${wsPath}/privateSettings/integrations`);
           } catch (wrapped) {

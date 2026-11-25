@@ -1117,6 +1117,13 @@ export const useAppStore = create<AppState>((set, get) => {
             });
           },
           (fatalErr) => {
+            if (isNetworkFailureError(fatalErr)) {
+              set({
+                cloudError: formatFirebaseError(fatalErr, get().language),
+                syncStatus: 'offline',
+              });
+              return;
+            }
             set({
               fatalSyncError: fatalErr,
               cloudError: formatFirebaseError(fatalErr, get().language),
@@ -1589,7 +1596,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       const { cloudConnected, cloudConnecting, workspaceContext, db } = get();
       if (cloudConnected && workspaceContext) {
-        const health = await checkWorkspaceSyncHealth(workspaceContext);
+        const health = await checkWorkspaceSyncHealth(workspaceContext, get().language);
         set({ lastSyncCheckAt: new Date().toISOString() });
         if (!health.ok) {
           set({ cloudError: health.error ?? null });
