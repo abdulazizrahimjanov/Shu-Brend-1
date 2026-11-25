@@ -37,6 +37,7 @@ import {
   isValidUsername,
   normalizeUsername,
   OperationType,
+  resetFirestoreNetwork,
   signInOrCreateEmployeeAuthSecondary,
   signInOrCreatePrimaryOwnerAuth,
   USE_CLOUD_FUNCTIONS,
@@ -2975,7 +2976,8 @@ export async function checkWorkspaceSyncHealth(
       return { ok: true };
     } catch (err) {
       if (attempt === 0 && isTransientFirestoreError(err)) {
-        await new Promise((r) => setTimeout(r, 1200));
+        await resetFirestoreNetwork();
+        await new Promise((r) => setTimeout(r, 800));
         continue;
       }
       return {
@@ -3260,7 +3262,7 @@ export function subscribeWorkspaceRealtime(
       },
       (err) => {
         if (isTransientFirestoreError(err)) {
-          void ensureFirestoreNetwork();
+          void resetFirestoreNetwork();
           console.warn('[firebaseSync] Transient listener reconnect on workspace root:', err);
           return;
         }
@@ -3303,7 +3305,7 @@ export function subscribeWorkspaceRealtime(
       },
       (err) => {
         if (isTransientFirestoreError(err)) {
-          void ensureFirestoreNetwork();
+          void resetFirestoreNetwork();
           console.warn('[firebaseSync] Transient listener reconnect on member doc:', err);
           return;
         }
@@ -3445,7 +3447,7 @@ export function subscribeWorkspaceRealtime(
             }
 
             if (isTransientFirestoreError(err)) {
-              void ensureFirestoreNetwork();
+              void resetFirestoreNetwork();
               console.warn(`[firebaseSync] Transient listener reconnect on ${colPath}:`, err);
               return;
             }
@@ -3586,7 +3588,7 @@ export function subscribeWorkspaceRealtime(
         },
         (err) => {
           if (isTransientFirestoreError(err)) {
-            void ensureFirestoreNetwork();
+            void resetFirestoreNetwork();
             console.warn('[firebaseSync] Transient listener reconnect on privateSettings:', err);
             return;
           }

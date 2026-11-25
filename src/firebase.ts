@@ -15,6 +15,7 @@ import {
 import {
   Firestore,
   FirestoreSettings,
+  disableNetwork,
   doc,
   enableNetwork,
   getDocFromServer,
@@ -183,6 +184,9 @@ export function handleFirestoreError(
   throw new Error(serialized);
 }
 
+let activeNetworkResetPromise: Promise<void> | null = null;
+let lastNetworkResetAt = 0;
+
 export async function ensureFirestoreNetwork(): Promise<void> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   try {
@@ -190,6 +194,31 @@ export async function ensureFirestoreNetwork(): Promise<void> {
   } catch {
     // ignore transient enableNetwork issues
   }
+}
+
+export async function resetFirestoreNetwork(force = false): Promise<void> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const now = Date.now();
+  if (!force && now - lastNetworkResetAt < 4000 && !activeNetworkResetPromise) {
+    await ensureFirestoreNetwork();
+    return;
+  }
+  if (activeNetworkResetPromise) {
+    return activeNetworkResetPromise;
+  }
+  activeNetworkResetPromise = (async () => {
+    try {
+      await disableNetwork(firestoreDb);
+      await new Promise((r) => setTimeout(r, 150));
+      await enableNetwork(firestoreDb);
+      lastNetworkResetAt = Date.now();
+    } catch {
+      await ensureFirestoreNetwork();
+    } finally {
+      activeNetworkResetPromise = null;
+    }
+  })();
+  return activeNetworkResetPromise;
 }
 
 function extractRawErrorMessage(error: unknown): { code: string; message: string } {
@@ -272,7 +301,17 @@ export function formatFirebaseError(error: unknown, lang: 'uz' | 'ru' = 'uz'): s
       ? 'Недостаточно прав доступа в Firebase (Firestore Security Rules).'
       : "Ushbu amalni bulutga yozish uchun ruxsat yetarli emas. Administrator bilan bog'laning.";
   }
-  if (low.includes('unavailable') || low.includes('client is offline') || low.includes('network')) {
+  if (
+    low.includes('unavailable') ||
+    low.includes('client is offline') ||
+    low.includes('network-request-failed') ||
+    low.includes('network error') ||
+    low.includes('networkerror') ||
+    low.includes('could not reach cloud firestore') ||
+    low.includes('failed to fetch') ||
+    low.includes('firestore-probe-timeout') ||
+    low.includes('firestore-health-timeout')
+  ) {
     return lang === 'ru'
       ? 'Сервер временно недоступен. Изменения сохранены локально и синхронизируются при восстановлении связи.'
       : "Server bilan aloqa vaqtincha uzildi. O'zgarishlar qurilmada saqlandi va aloqa tiklanganda yuboriladi.";
@@ -298,7 +337,9 @@ export function isTransientFirestoreError(error: unknown): boolean {
     low.includes('unavailable') ||
     low.includes('client is offline') ||
     low.includes('network-request-failed') ||
-    low.includes('network') ||
+    low.includes('network error') ||
+    low.includes('networkerror') ||
+    low.includes('could not reach cloud firestore') ||
     low.includes('timeout') ||
     low.includes('deadline-exceeded') ||
     low.includes('aborted') ||
@@ -346,9 +387,11 @@ export async function probeFirestoreConnection(
         (low.includes('the client is offline') ||
           low.includes('unavailable') ||
           low.includes('timeout') ||
+          low.includes('could not reach') ||
           low.includes('network'));
       if (isRetryable) {
-        await new Promise((r) => setTimeout(r, 1200));
+        await resetFirestoreNetwork();
+        await new Promise((r) => setTimeout(r, 800));
         continue;
       }
       return {

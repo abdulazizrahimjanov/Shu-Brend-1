@@ -52,6 +52,7 @@ import {
   isValidUsername,
   normalizeUsername,
   probeFirestoreConnection,
+  resetFirestoreNetwork,
   signInWithUsernamePassword,
   signOutFirebase,
   testConnection,
@@ -561,8 +562,26 @@ export function findDuplicateProductReason(
 }
 
 let migratedNamesCloudOnce = false;
+let onlineStabilizeTimer: number | undefined;
+let quickRetryTimer: number | undefined;
 
 export const useAppStore = create<AppState>((set, get) => {
+  const scheduleQuickQueueRetry = () => {
+    if (typeof window === 'undefined') return;
+    window.clearTimeout(quickRetryTimer);
+    quickRetryTimer = window.setTimeout(() => {
+      const latest = get();
+      if (
+        latest.isOnline &&
+        latest.cloudConnected &&
+        !latest.isSyncingQueue &&
+        (latest.db?.offlineQueue.length ?? 0) > 0
+      ) {
+        void latest.syncOfflineQueue();
+      }
+    }, 3500);
+  };
+
   const pushSyncWithTransientRetry = async (
     ctx: WorkspaceContext,
     op: OfflineSyncItem,
@@ -580,8 +599,13 @@ export const useAppStore = create<AppState>((set, get) => {
           throw err;
         }
         if (attempt < maxRetries && get().isOnline) {
-          await ensureFirestoreNetwork();
-          await new Promise((r) => setTimeout(r, attempt === 0 ? 650 : 1300));
+          if (attempt === 0) {
+            await ensureFirestoreNetwork();
+            await new Promise((r) => setTimeout(r, 600));
+          } else {
+            await resetFirestoreNetwork();
+            await new Promise((r) => setTimeout(r, 1000));
+          }
           continue;
         }
         throw err;
@@ -649,6 +673,9 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       await repository.save(nextDb);
       set({ db: nextDb, syncStatus: 'offline' });
+      if (isOnline && cloudConnected && workspaceContext) {
+        scheduleQuickQueueRetry();
+      }
       return;
     }
 
@@ -689,6 +716,7 @@ export const useAppStore = create<AppState>((set, get) => {
             syncStatus: get().isOnline ? 'online' : 'offline',
             cloudError: formatFirebaseError(err, get().language),
           });
+          scheduleQuickQueueRetry();
         } else {
           const msg = formatFirebaseError(err, get().language);
           get().notify(msg, 'error');
@@ -1430,26 +1458,38 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     setOnline: (isOnline) => {
+      if (typeof window !== 'undefined') {
+        window.clearTimeout(onlineStabilizeTimer);
+        if (!isOnline) {
+          window.clearTimeout(quickRetryTimer);
+        }
+      }
       set({
         isOnline,
         syncStatus: isOnline ? 'online' : 'offline',
       });
-      if (isOnline) {
-        void ensureFirestoreNetwork()
-          .then(() => probeFirestoreConnection(get().language))
-          .then((probe) => {
-            set({
-              lastSyncCheckAt: new Date().toISOString(),
-              cloudError: probe.ok ? null : probe.error ?? null,
-            });
-            if (probe.ok) {
-              if (!get().cloudConnected && !get().cloudConnecting && auth.currentUser) {
-                void connectFirebaseUser(auth.currentUser, { setSessionIfMissing: true });
-              } else if (get().cloudConnected && (get().db?.offlineQueue.length ?? 0) > 0) {
-                void get().syncOfflineQueue();
+      if (isOnline && typeof window !== 'undefined') {
+        onlineStabilizeTimer = window.setTimeout(() => {
+          if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+          void resetFirestoreNetwork()
+            .then(() => probeFirestoreConnection(get().language))
+            .then((probe) => {
+              const hasQueued = (get().db?.offlineQueue.length ?? 0) > 0;
+              set({
+                lastSyncCheckAt: new Date().toISOString(),
+                cloudError: probe.ok ? null : hasQueued ? probe.error ?? null : null,
+              });
+              if (probe.ok) {
+                if (!get().cloudConnected && !get().cloudConnecting && auth.currentUser) {
+                  void connectFirebaseUser(auth.currentUser, { setSessionIfMissing: true });
+                } else if (get().cloudConnected && (get().db?.offlineQueue.length ?? 0) > 0) {
+                  void get().syncOfflineQueue();
+                }
+              } else if (get().cloudConnected && hasQueued) {
+                scheduleQuickQueueRetry();
               }
-            }
-          });
+            });
+        }, 1200);
       }
     },
 
@@ -1596,20 +1636,27 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       const { cloudConnected, cloudConnecting, workspaceContext, db } = get();
       if (cloudConnected && workspaceContext) {
-        const health = await checkWorkspaceSyncHealth(workspaceContext, get().language);
-        set({ lastSyncCheckAt: new Date().toISOString() });
-        if (!health.ok) {
-          set({ cloudError: health.error ?? null });
-          return;
-        }
         if (db && db.offlineQueue.length > 0) {
           await get().syncOfflineQueue();
         }
-        const syncedAt = new Date().toISOString();
+        const remainingCount = get().db?.offlineQueue.length ?? 0;
+        if (remainingCount > 0) {
+          return;
+        }
+        const health = await checkWorkspaceSyncHealth(workspaceContext, get().language);
+        const checkedAt = new Date().toISOString();
+        if (!health.ok) {
+          set({
+            lastSyncCheckAt: checkedAt,
+            cloudError: null,
+            syncStatus: get().isOnline ? 'online' : 'offline',
+          });
+          return;
+        }
         set({
           cloudError: null,
-          lastSyncAt: syncedAt,
-          lastSyncCheckAt: syncedAt,
+          lastSyncAt: checkedAt,
+          lastSyncCheckAt: checkedAt,
           syncStatus: get().isOnline ? 'online' : 'offline',
         });
       } else if (auth.currentUser && !cloudConnecting) {
@@ -1621,6 +1668,7 @@ export const useAppStore = create<AppState>((set, get) => {
           firebaseEmail: null,
           workspaceContext: null,
           syncStatus: 'online',
+          cloudError: null,
         });
       }
     },
@@ -2947,38 +2995,57 @@ export const useAppStore = create<AppState>((set, get) => {
 
         if (!isOnline) return 0;
         set({ syncStatus: 'syncing', isSyncingQueue: true });
-        await ensureFirestoreNetwork();
+        const hasPriorRetries = db.offlineQueue.some((q) => (q.attempts || 0) > 0);
+        if (hasPriorRetries) {
+          await resetFirestoreNetwork();
+        } else {
+          await ensureFirestoreNetwork();
+        }
 
         const remaining: OfflineSyncItem[] = [];
         let syncedCount = 0;
         let lastErr: unknown = null;
+        let didResetDuringFlush = hasPriorRetries;
         const workingDb: DatabaseSnapshot = structuredClone(db);
         const nowIso = new Date().toISOString();
 
         for (const item of workingDb.offlineQueue) {
-          try {
-            await pushSyncItemToFirestore(workspaceContext, item, workingDb);
-            syncedCount += 1;
-            if (item.type === 'sale' || item.type === 'sale_pay_deferred') {
-              const sId = String((item.payload as Record<string, unknown>)?.saleId || '');
-              const s = workingDb.sales.find((x) => x.id === sId);
-              if (s) s.syncedAt = nowIso;
-            }
-          } catch (err) {
-            if (isPermissionError(err) || err instanceof BusinessRuleError) {
-              if (err instanceof BusinessRuleError) {
-                get().notify(err.message, 'error');
+          let pushed = false;
+          for (let tryIdx = 0; tryIdx < 2 && !pushed; tryIdx += 1) {
+            try {
+              await pushSyncItemToFirestore(workspaceContext, item, workingDb);
+              syncedCount += 1;
+              pushed = true;
+              if (item.type === 'sale' || item.type === 'sale_pay_deferred') {
+                const sId = String((item.payload as Record<string, unknown>)?.saleId || '');
+                const s = workingDb.sales.find((x) => x.id === sId);
+                if (s) s.syncedAt = nowIso;
               }
-              // Drop rejected/invalid operations so queue never loops infinitely
-              continue;
+            } catch (err) {
+              if (isPermissionError(err) || err instanceof BusinessRuleError) {
+                if (err instanceof BusinessRuleError) {
+                  get().notify(err.message, 'error');
+                }
+                // Drop rejected/invalid operations so queue never loops infinitely
+                pushed = true;
+                break;
+              }
+              if (tryIdx === 0 && isNetworkFailureError(err) && !didResetDuringFlush) {
+                didResetDuringFlush = true;
+                await resetFirestoreNetwork(true);
+                await new Promise((r) => setTimeout(r, 400));
+                continue;
+              }
+              const nextAttempts = (item.attempts || 0) + 1;
+              if (!isNetworkFailureError(err) && nextAttempts >= 3) {
+                // Drop permanent non-network failures after 3 retries
+                pushed = true;
+                break;
+              }
+              lastErr = err;
+              remaining.push({ ...item, attempts: nextAttempts });
+              break;
             }
-            const nextAttempts = (item.attempts || 0) + 1;
-            if (!isNetworkFailureError(err) && nextAttempts >= 3) {
-              // Drop permanent non-network failures after 3 retries
-              continue;
-            }
-            lastErr = err;
-            remaining.push({ ...item, attempts: nextAttempts });
           }
         }
 
@@ -2998,6 +3065,9 @@ export const useAppStore = create<AppState>((set, get) => {
           ...(syncedCount > 0 || remaining.length === 0 ? { lastSyncAt: doneIso } : {}),
           cloudError: remaining.length > 0 && lastErr ? formatFirebaseError(lastErr, get().language) : null,
         });
+        if (remaining.length > 0 && get().isOnline) {
+          scheduleQuickQueueRetry();
+        }
         return syncedCount;
       };
 

@@ -124,7 +124,7 @@ export default function App() {
       ) {
         void st.checkAndSyncNow();
       }
-    }, 20000);
+    }, 10000);
 
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
