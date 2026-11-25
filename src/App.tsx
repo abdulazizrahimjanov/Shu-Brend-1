@@ -98,11 +98,36 @@ export default function App() {
     init();
     const onOnline = () => setOnline(true);
     const onOffline = () => setOnline(false);
+    const onResume = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const st = useAppStore.getState();
+      if (navigator.onLine && (st.cloudError || (st.db?.offlineQueue.length ?? 0) > 0 || st.cloudConnected)) {
+        void st.checkAndSyncNow();
+      }
+    };
+
+    const syncInterval = window.setInterval(() => {
+      const st = useAppStore.getState();
+      if (
+        st.isOnline &&
+        st.cloudConnected &&
+        !st.isSyncingQueue &&
+        ((st.db?.offlineQueue.length ?? 0) > 0 || Boolean(st.cloudError))
+      ) {
+        void st.checkAndSyncNow();
+      }
+    }, 20000);
+
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
+      window.clearInterval(syncInterval);
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, [init, setOnline]);
 

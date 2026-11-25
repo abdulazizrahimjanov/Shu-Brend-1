@@ -62,6 +62,9 @@ export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCat
         if (!active) return;
         setAlreadyBootstrapped(res.bootstrapped);
         setSetupMode(!res.bootstrapped && !res.offline);
+        if (!res.offline) {
+          clearCloudError();
+        }
       })
       .finally(() => {
         if (active) setCheckingBootstrap(false);
@@ -69,7 +72,7 @@ export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCat
     return () => {
       active = false;
     };
-  }, []);
+  }, [clearCloudError]);
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

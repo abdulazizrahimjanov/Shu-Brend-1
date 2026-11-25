@@ -48,11 +48,13 @@ import {
   createEmployeeAuthSecondary,
   ensureFirestoreNetwork,
   formatFirebaseError,
+  isTransientFirestoreError,
   isValidUsername,
   normalizeUsername,
   probeFirestoreConnection,
   signInWithUsernamePassword,
   signOutFirebase,
+  testConnection,
   updateOwnPasswordAuth,
   USE_CLOUD_FUNCTIONS,
   usernameToAuthEmail,
@@ -435,15 +437,7 @@ function isPermissionError(err: unknown): boolean {
 }
 
 function isNetworkFailureError(err: unknown): boolean {
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
-  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
-  return (
-    msg.includes('unavailable') ||
-    msg.includes('client is offline') ||
-    msg.includes('network-request-failed') ||
-    msg.includes('timeout') ||
-    msg.includes('failed to fetch')
-  );
+  return isTransientFirestoreError(err);
 }
 
 const UNIVERSAL_POS_PERMS: Permission[] = [
@@ -569,6 +563,33 @@ export function findDuplicateProductReason(
 let migratedNamesCloudOnce = false;
 
 export const useAppStore = create<AppState>((set, get) => {
+  const pushSyncWithTransientRetry = async (
+    ctx: WorkspaceContext,
+    op: OfflineSyncItem,
+    snapshot: DatabaseSnapshot,
+    maxRetries = 2
+  ) => {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      try {
+        await pushSyncItemToFirestore(ctx, op, snapshot);
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof BusinessRuleError || isPermissionError(err) || !isNetworkFailureError(err)) {
+          throw err;
+        }
+        if (attempt < maxRetries && get().isOnline) {
+          await ensureFirestoreNetwork();
+          await new Promise((r) => setTimeout(r, attempt === 0 ? 650 : 1300));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr;
+  };
+
   const syncOrEnqueue = async (
     nextDb: DatabaseSnapshot,
     opInput: Omit<OfflineSyncItem, 'idempotencyKey'>,
@@ -585,7 +606,7 @@ export const useAppStore = create<AppState>((set, get) => {
     if (options?.strict && isOnline && cloudConnected && workspaceContext) {
       set({ syncStatus: 'syncing' });
       try {
-        await pushSyncItemToFirestore(workspaceContext, op, nextDb);
+        await pushSyncWithTransientRetry(workspaceContext, op, nextDb, 1);
         await repository.save(nextDb);
         const syncedAt = new Date().toISOString();
         set({
@@ -637,7 +658,7 @@ export const useAppStore = create<AppState>((set, get) => {
     if (cloudConnected && workspaceContext) {
       set({ syncStatus: 'syncing' });
       try {
-        await pushSyncItemToFirestore(workspaceContext, op, nextDb);
+        await pushSyncWithTransientRetry(workspaceContext, op, nextDb, 2);
         const syncedAt = new Date().toISOString();
         set({
           syncStatus: get().isOnline ? 'online' : 'offline',
@@ -656,7 +677,7 @@ export const useAppStore = create<AppState>((set, get) => {
               : "Ushbu amalni bulutga yozish uchun ruxsatingiz yetarli emas";
           get().notify(msg, 'error');
           set({ syncStatus: get().isOnline ? 'online' : 'offline', cloudError: msg });
-        } else {
+        } else if (isNetworkFailureError(err)) {
           // Transient / network issue -> queue for auto-sync when connection stabilizes
           const latestDb = structuredClone(get().db ?? nextDb);
           if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
@@ -667,6 +688,13 @@ export const useAppStore = create<AppState>((set, get) => {
             db: latestDb,
             syncStatus: get().isOnline ? 'online' : 'offline',
             cloudError: formatFirebaseError(err, get().language),
+          });
+        } else {
+          const msg = formatFirebaseError(err, get().language);
+          get().notify(msg, 'error');
+          set({
+            syncStatus: get().isOnline ? 'online' : 'offline',
+            cloudError: msg,
           });
         }
       }
@@ -1195,14 +1223,10 @@ export const useAppStore = create<AppState>((set, get) => {
       activeInitPromise = (async () => {
       const theme = get().theme;
       applyThemeToDOM(theme);
-      void probeFirestoreConnection(get().language).then((probe) => {
+      void testConnection().then((ok) => {
         set((state) => ({
           lastSyncCheckAt: new Date().toISOString(),
-          ...(probe.ok
-            ? { cloudError: null }
-            : !state.cloudConnected && probe.error
-            ? { cloudError: probe.error }
-            : {}),
+          ...(ok ? { cloudError: null } : state.cloudError ? {} : {}),
         }));
       });
 
@@ -2916,6 +2940,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
         if (!isOnline) return 0;
         set({ syncStatus: 'syncing', isSyncingQueue: true });
+        await ensureFirestoreNetwork();
 
         const remaining: OfflineSyncItem[] = [];
         let syncedCount = 0;
@@ -2940,8 +2965,13 @@ export const useAppStore = create<AppState>((set, get) => {
               // Drop rejected/invalid operations so queue never loops infinitely
               continue;
             }
+            const nextAttempts = (item.attempts || 0) + 1;
+            if (!isNetworkFailureError(err) && nextAttempts >= 3) {
+              // Drop permanent non-network failures after 3 retries
+              continue;
+            }
             lastErr = err;
-            remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
+            remaining.push({ ...item, attempts: nextAttempts });
           }
         }
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Download, WifiOff } from 'lucide-react';
+import { Download, RefreshCw, WifiOff } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { useT } from '../i18n';
 
@@ -123,17 +123,21 @@ export const OfflineIndicator: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const cloudError = useAppStore((s) => s.cloudError);
   const cloudConnected = useAppStore((s) => s.cloudConnected);
+  const isSyncingQueue = useAppStore((s) => s.isSyncingQueue);
   const pendingCount = useAppStore((s) => s.db?.offlineQueue.length ?? 0);
   const clearCloudError = useAppStore((s) => s.clearCloudError);
+  const checkAndSyncNow = useAppStore((s) => s.checkAndSyncNow);
   const t = useT();
 
   const showError = Boolean(cloudError && (cloudConnected || !isOnline));
   if (isOnline && !showError) return null;
 
+  const isTransientQueue = pendingCount > 0;
+
   return (
     <div
       className={`no-print fixed bottom-20 md:bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-2.5 rounded-lg border px-3 py-2 text-xs font-medium shadow-lg ${
-        showError && isOnline
+        showError && isOnline && !isTransientQueue
           ? 'border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/95 text-red-900 dark:text-red-100'
           : 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/95 text-amber-900 dark:text-amber-100'
       }`}
@@ -148,15 +152,30 @@ export const OfflineIndicator: React.FC = () => {
         </div>
       ) : (
         <>
-          <span className="line-clamp-2">{cloudError}</span>
-          <button
-            type="button"
-            onClick={clearCloudError}
-            className="px-1.5 py-1 text-[11px] opacity-75 hover:opacity-100 shrink-0"
-            aria-label={t.common.close}
-          >
-            ✕
-          </button>
+          <span className="line-clamp-2 flex-1">
+            {cloudError}
+            {pendingCount > 0 ? ` (${pendingCount})` : ''}
+          </span>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              disabled={isSyncingQueue}
+              onClick={() => void checkAndSyncNow()}
+              className="inline-flex items-center gap-1 rounded border border-current/25 px-2 py-1 text-[11px] font-semibold hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+              title={t.common.syncNow}
+            >
+              <RefreshCw className={`w-3 h-3 ${isSyncingQueue ? 'animate-spin' : ''}`} />
+              <span>{t.common.syncNow}</span>
+            </button>
+            <button
+              type="button"
+              onClick={clearCloudError}
+              className="px-1.5 py-1 text-[11px] opacity-75 hover:opacity-100 shrink-0"
+              aria-label={t.common.close}
+            >
+              ✕
+            </button>
+          </div>
         </>
       )}
     </div>

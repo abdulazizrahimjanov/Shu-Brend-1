@@ -133,10 +133,7 @@ const baseFirestoreSettings: FirestoreSettings = {
   ignoreUndefinedProperties: true,
   ...(isBrowser
     ? {
-        experimentalForceLongPolling: true,
-        experimentalLongPollingOptions: {
-          timeoutSeconds: 15,
-        },
+        experimentalAutoDetectLongPolling: true,
       }
     : {}),
 };
@@ -293,6 +290,22 @@ export function formatFirebaseError(error: unknown, lang: 'uz' | 'ru' = 'uz'): s
 
 export const formatFirebaseErrorMessage = formatFirebaseError;
 
+export function isTransientFirestoreError(error: unknown): boolean {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+  const { code, message } = extractRawErrorMessage(error);
+  const low = `${code} ${message}`.toLowerCase();
+  return (
+    low.includes('unavailable') ||
+    low.includes('client is offline') ||
+    low.includes('network-request-failed') ||
+    low.includes('network') ||
+    low.includes('timeout') ||
+    low.includes('deadline-exceeded') ||
+    low.includes('aborted') ||
+    low.includes('failed to fetch')
+  );
+}
+
 export async function probeFirestoreConnection(
   lang: 'uz' | 'ru' = 'uz'
 ): Promise<{ ok: boolean; error?: string; code?: string }> {
@@ -310,7 +323,7 @@ export async function probeFirestoreConnection(
   const probe = async () => {
     await ensureFirestoreNetwork();
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('firestore-probe-timeout')), 8000);
+      setTimeout(() => reject(new Error('firestore-probe-timeout')), 15000);
     });
     await Promise.race([
       getDocFromServer(doc(firestoreDb, 'test', 'connection')),
@@ -318,39 +331,37 @@ export async function probeFirestoreConnection(
     ]);
   };
 
-  try {
-    await probe();
-    return { ok: true };
-  } catch (error) {
-    const { code, message } = extractRawErrorMessage(error);
-    const low = `${code} ${message}`.toLowerCase();
-    if (low.includes('permission-denied') || low.includes('missing or insufficient')) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await probe();
       return { ok: true };
-    }
-    if (low.includes('the client is offline') || low.includes('unavailable') || low.includes('timeout')) {
-      await new Promise((r) => setTimeout(r, 900));
-      try {
-        await probe();
+    } catch (error) {
+      const { code, message } = extractRawErrorMessage(error);
+      const low = `${code} ${message}`.toLowerCase();
+      if (low.includes('permission-denied') || low.includes('missing or insufficient')) {
         return { ok: true };
-      } catch (retryErr) {
-        const retryInfo = extractRawErrorMessage(retryErr);
-        const retryLow = `${retryInfo.code} ${retryInfo.message}`.toLowerCase();
-        if (retryLow.includes('permission-denied') || retryLow.includes('missing or insufficient')) {
-          return { ok: true };
-        }
-        return {
-          ok: false,
-          code: retryInfo.code || 'unavailable',
-          error: formatFirebaseError(retryErr, lang),
-        };
       }
+      const isRetryable =
+        attempt === 0 &&
+        (low.includes('the client is offline') ||
+          low.includes('unavailable') ||
+          low.includes('timeout') ||
+          low.includes('network'));
+      if (isRetryable) {
+        await new Promise((r) => setTimeout(r, 1200));
+        continue;
+      }
+      return {
+        ok: false,
+        code: code || (low.includes('timeout') ? 'unavailable' : 'unknown'),
+        error: low.includes('timeout')
+          ? formatFirebaseError(new Error('unavailable'), lang)
+          : formatFirebaseError(error, lang),
+      };
     }
-    return {
-      ok: false,
-      code: code || 'unknown',
-      error: formatFirebaseError(error, lang),
-    };
   }
+
+  return { ok: true };
 }
 
 export async function testConnection(): Promise<boolean> {
