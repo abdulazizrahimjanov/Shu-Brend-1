@@ -1117,6 +1117,28 @@ function buildInvitedEmailsFromSnapshot(snapshot: DatabaseSnapshot): string[] {
 
 // --- Bootstrap Status Check & First-Run Owner Setup ---
 
+export async function resolveActiveWorkspaceId(): Promise<string> {
+  const ref = doc(firestoreDb, 'systemMeta', 'bootstrap');
+  try {
+    const snap = await getDocFromServer(ref);
+    if (snap.exists() && snap.data()?.bootstrapped === true) {
+      const wsId = String(snap.data()?.workspaceId || '').trim();
+      if (wsId) return sanitizeId(wsId);
+    }
+  } catch {
+    try {
+      const cached = await getDoc(ref);
+      if (cached.exists() && cached.data()?.bootstrapped === true) {
+        const wsId = String(cached.data()?.workspaceId || '').trim();
+        if (wsId) return sanitizeId(wsId);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return PRIMARY_WORKSPACE_ID;
+}
+
 export async function checkWorkspaceBootstrapStatus(): Promise<{
   bootstrapped: boolean;
   offline?: boolean;
@@ -1313,32 +1335,45 @@ export async function bootstrapFirstOwnerWorkspace(
   let memberUids = empAuth ? [ownerAuth.uid, empAuth.uid] : [ownerAuth.uid];
   let invitedEmails = empAuth ? [ownerEmail, empAuth.email] : [ownerEmail];
   const ownerPerms = mapAppPermissionsToRuleTokens([], 'owner');
+  let targetWorkspaceId = PRIMARY_WORKSPACE_ID;
   let wsAlreadyExisted = false;
 
-  const wsRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID);
+  let wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
   try {
     const existingWsSnap = await getDoc(wsRef);
-    wsAlreadyExisted = existingWsSnap.exists();
-    if (wsAlreadyExisted) {
+    if (existingWsSnap.exists()) {
       const wsExisting = existingWsSnap.data() || {};
       const existingOwnerUid = String(wsExisting.ownerUid || '');
       if (existingOwnerUid && existingOwnerUid !== ownerAuth.uid) {
-        throw new Error("Tizim allaqachon boshqa egasi nomiga sozlangan! Login va parol bilan kiring.");
+        targetWorkspaceId = sanitizeId(`ws-shubrend-${ownerAuth.uid.slice(0, 12)}`);
+        wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
+        const altSnap = await getDoc(wsRef);
+        wsAlreadyExisted = altSnap.exists();
+      } else {
+        wsAlreadyExisted = true;
+        const existingMembers = Array.isArray(wsExisting.memberUids)
+          ? wsExisting.memberUids.map(String)
+          : [];
+        const existingInvited = Array.isArray(wsExisting.invitedEmails)
+          ? wsExisting.invitedEmails.map((e: unknown) => String(e).toLowerCase())
+          : [];
+        memberUids = Array.from(new Set([...existingMembers, ...memberUids])).slice(0, 150);
+        invitedEmails = Array.from(new Set([...existingInvited, ...invitedEmails])).slice(0, 150);
       }
-      const existingMembers = Array.isArray(wsExisting.memberUids)
-        ? wsExisting.memberUids.map(String)
-        : [];
-      const existingInvited = Array.isArray(wsExisting.invitedEmails)
-        ? wsExisting.invitedEmails.map((e: unknown) => String(e).toLowerCase())
-        : [];
-      memberUids = Array.from(new Set([...existingMembers, ...memberUids])).slice(0, 150);
-      invitedEmails = Array.from(new Set([...existingInvited, ...invitedEmails])).slice(0, 150);
     }
   } catch (err) {
     const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-    if (msg.includes('boshqa egasi')) throw err;
-    if (!msg.includes('permission') && !msg.includes('insufficient')) {
-      handleFirestoreError(err, OperationType.GET, `workspaces/${PRIMARY_WORKSPACE_ID}`);
+    if (msg.includes('permission') || msg.includes('insufficient')) {
+      targetWorkspaceId = sanitizeId(`ws-shubrend-${ownerAuth.uid.slice(0, 12)}`);
+      wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
+      try {
+        const altSnap = await getDoc(wsRef);
+        wsAlreadyExisted = altSnap.exists();
+      } catch {
+        wsAlreadyExisted = false;
+      }
+    } else {
+      handleFirestoreError(err, OperationType.GET, `workspaces/${targetWorkspaceId}`);
     }
   }
 
@@ -1350,16 +1385,16 @@ export async function bootstrapFirstOwnerWorkspace(
       await setDoc(profRef, {
         id: ownerAuth.uid,
         displayName: cleanOwnerName,
-        activeWorkspaceId: PRIMARY_WORKSPACE_ID,
-        workspaceIds: [PRIMARY_WORKSPACE_ID],
+        activeWorkspaceId: targetWorkspaceId,
+        workspaceIds: [targetWorkspaceId],
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     } else {
       await updateDoc(profRef, {
         displayName: cleanOwnerName,
-        activeWorkspaceId: PRIMARY_WORKSPACE_ID,
-        workspaceIds: [PRIMARY_WORKSPACE_ID],
+        activeWorkspaceId: targetWorkspaceId,
+        workspaceIds: [targetWorkspaceId],
         updatedAt: serverTimestamp(),
       });
     }
@@ -1372,7 +1407,8 @@ export async function bootstrapFirstOwnerWorkspace(
     handleFirestoreError(err, OperationType.WRITE, `userProfiles/${ownerAuth.uid}`);
   }
 
-  // 4b. Platform admin record (must happen before workspace create or when ownerUid matches)
+  // 4b. Platform admin record (non-fatal if legacy ws-shubrend-main is still present under old owner)
+  let isPlatformAdmin = false;
   try {
     const adminRef = doc(firestoreDb, 'admins', ownerAuth.uid);
     const adminSnap = await getDoc(adminRef);
@@ -1383,15 +1419,19 @@ export async function bootstrapFirstOwnerWorkspace(
         createdAt: serverTimestamp(),
       });
     }
+    isPlatformAdmin = true;
   } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `admins/${ownerAuth.uid}`);
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    if (!msg.includes('permission') && !msg.includes('insufficient')) {
+      handleFirestoreError(err, OperationType.CREATE, `admins/${ownerAuth.uid}`);
+    }
   }
 
   // 4c. Workspace Root
   try {
     if (!wsAlreadyExisted) {
       await setDoc(wsRef, {
-        id: PRIMARY_WORKSPACE_ID,
+        id: targetWorkspaceId,
         name: nonEmptyStr(nextSnap.settings.brandName, 120, 'SHU BREND OMBOR'),
         ownerUid: ownerAuth.uid,
         ownerEmail,
@@ -1420,13 +1460,13 @@ export async function bootstrapFirstOwnerWorkspace(
     handleFirestoreError(
       err,
       wsAlreadyExisted ? OperationType.UPDATE : OperationType.CREATE,
-      `workspaces/${PRIMARY_WORKSPACE_ID}`
+      `workspaces/${targetWorkspaceId}`
     );
   }
 
   // 4d. Workspace Members & Private Settings & Bootstrap Meta
   try {
-    const ownerMemberRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'members', ownerAuth.uid);
+    const ownerMemberRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'members', ownerAuth.uid);
     const ownerMemberSnap = await getDoc(ownerMemberRef);
     if (!ownerMemberSnap.exists()) {
       await setDoc(ownerMemberRef, {
@@ -1460,7 +1500,7 @@ export async function bootstrapFirstOwnerWorkspace(
     if (empAuth) {
       const cashierRole = nextSnap.roles.find((r) => r.id === 'cashier');
       const cashierPerms = mapAppPermissionsToRuleTokens(cashierRole?.permissions ?? [], 'cashier');
-      const empMemberRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'members', empAuth.uid);
+      const empMemberRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'members', empAuth.uid);
       const empMemberSnap = await getDoc(empMemberRef);
       if (!empMemberSnap.exists()) {
         await setDoc(empMemberRef, {
@@ -1492,7 +1532,7 @@ export async function bootstrapFirstOwnerWorkspace(
       }
     }
 
-    const privRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'privateSettings', 'integrations');
+    const privRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'privateSettings', 'integrations');
     const privSnap = await getDoc(privRef);
     if (!privSnap.exists()) {
       await setDoc(privRef, {
@@ -1518,16 +1558,16 @@ export async function bootstrapFirstOwnerWorkspace(
       await setDoc(bootRef, {
         id: 'bootstrap',
         bootstrapped: true,
-        workspaceId: PRIMARY_WORKSPACE_ID,
+        workspaceId: targetWorkspaceId,
         createdAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `workspaces/${PRIMARY_WORKSPACE_ID}/members`);
+    handleFirestoreError(err, OperationType.WRITE, `workspaces/${targetWorkspaceId}/members`);
   }
 
   const wsContextResult: WorkspaceContext = {
-    workspaceId: PRIMARY_WORKSPACE_ID,
+    workspaceId: targetWorkspaceId,
     uid: ownerAuth.uid,
     email: ownerEmail,
     username: cleanOwnerUsername,
@@ -1537,7 +1577,7 @@ export async function bootstrapFirstOwnerWorkspace(
     adminUids: [ownerAuth.uid],
     invitedEmails,
     isWsAdmin: true,
-    isPlatformAdmin: true,
+    isPlatformAdmin,
     roleId: 'owner',
     assignedStoreIds: storeIds,
     staffId: ownerEmpId,
@@ -1547,7 +1587,7 @@ export async function bootstrapFirstOwnerWorkspace(
   if (!wsAlreadyExisted) {
     await migrateSnapshotToWorkspace(
       {
-        workspaceId: PRIMARY_WORKSPACE_ID,
+        workspaceId: targetWorkspaceId,
         ownerUid: ownerAuth.uid,
         memberUids,
         adminUids: [ownerAuth.uid],
@@ -1559,7 +1599,7 @@ export async function bootstrapFirstOwnerWorkspace(
     // Workspace existed from an interrupted attempt: only fill missing catalog/staff docs safely
     await migrateLocalAdditionsToWorkspace(wsContextResult, nextSnap, { includeSeedLike: true });
     const staffWriter = new ChunkedBatchWriter();
-    const wsPath = `workspaces/${PRIMARY_WORKSPACE_ID}`;
+    const wsPath = `workspaces/${targetWorkspaceId}`;
     const staffTenant = { ownerUid: ownerAuth.uid, memberUids, uid: ownerAuth.uid };
     const adminTenant = { ownerUid: ownerAuth.uid, adminUids: [ownerAuth.uid], uid: ownerAuth.uid };
 
@@ -1612,6 +1652,8 @@ export async function bootstrapOrJoinWorkspace(
     'Xodim'
   );
 
+  const targetWorkspaceId = await resolveActiveWorkspaceId();
+
   // 1. Resolve platform admin record
   let isPlatformAdmin = false;
   const adminRef = doc(firestoreDb, 'admins', uid);
@@ -1630,8 +1672,8 @@ export async function bootstrapOrJoinWorkspace(
       await setDoc(profileRef, {
         id: uid,
         displayName,
-        activeWorkspaceId: PRIMARY_WORKSPACE_ID,
-        workspaceIds: [PRIMARY_WORKSPACE_ID],
+        activeWorkspaceId: targetWorkspaceId,
+        workspaceIds: [targetWorkspaceId],
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
@@ -1640,12 +1682,12 @@ export async function bootstrapOrJoinWorkspace(
       const existingWsIds = Array.isArray(pd?.workspaceIds)
         ? pd.workspaceIds.map((w: unknown) => String(w)).filter(Boolean)
         : [];
-      const nextWsIds = existingWsIds.includes(PRIMARY_WORKSPACE_ID)
+      const nextWsIds = existingWsIds.includes(targetWorkspaceId)
         ? existingWsIds.slice(0, 20)
-        : [PRIMARY_WORKSPACE_ID, ...existingWsIds].slice(0, 20);
+        : [targetWorkspaceId, ...existingWsIds].slice(0, 20);
       await updateDoc(profileRef, {
         displayName,
-        activeWorkspaceId: PRIMARY_WORKSPACE_ID,
+        activeWorkspaceId: targetWorkspaceId,
         workspaceIds: nextWsIds,
         updatedAt: serverTimestamp(),
       });
@@ -1666,7 +1708,7 @@ export async function bootstrapOrJoinWorkspace(
   }
 
   // 3. Check primary shared workspace
-  const wsRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID);
+  const wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
   let wsSnap;
   try {
     wsSnap = await getDoc(wsRef);
@@ -1677,7 +1719,7 @@ export async function bootstrapOrJoinWorkspace(
         "Ushbu xodim hisobi hali umumiy ish maydoniga biriktirilmagan. Admindan Xodimlar bo'limidan ruxsat berishini so'rang."
       );
     }
-    handleFirestoreError(err, OperationType.GET, `workspaces/${PRIMARY_WORKSPACE_ID}`);
+    handleFirestoreError(err, OperationType.GET, `workspaces/${targetWorkspaceId}`);
   }
 
   // Case A: Workspace does not exist yet -> first authenticated user initializes workspace
@@ -1709,7 +1751,7 @@ export async function bootstrapOrJoinWorkspace(
 
     try {
       await setDoc(wsRef, {
-        id: PRIMARY_WORKSPACE_ID,
+        id: targetWorkspaceId,
         name: nonEmptyStr(localSnapshot.settings.brandName, 120, 'SHU BREND OMBOR'),
         ownerUid: uid,
         ownerEmail: email,
@@ -1723,7 +1765,7 @@ export async function bootstrapOrJoinWorkspace(
         updatedAt: serverTimestamp(),
       });
 
-      await setDoc(doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'members', uid), {
+      await setDoc(doc(firestoreDb, 'workspaces', targetWorkspaceId, 'members', uid), {
         uid,
         staffId: ownerStaffId,
         ...(username ? { username } : {}),
@@ -1738,7 +1780,7 @@ export async function bootstrapOrJoinWorkspace(
         updatedAt: serverTimestamp(),
       });
 
-      const privRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'privateSettings', 'integrations');
+      const privRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'privateSettings', 'integrations');
       if (!(await getDoc(privRef)).exists()) {
         await setDoc(privRef, {
           id: 'integrations',
@@ -1756,12 +1798,12 @@ export async function bootstrapOrJoinWorkspace(
         await setDoc(bootRef, {
           id: 'bootstrap',
           bootstrapped: true,
-          workspaceId: PRIMARY_WORKSPACE_ID,
+          workspaceId: targetWorkspaceId,
           createdAt: serverTimestamp(),
         });
       }
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `workspaces/${PRIMARY_WORKSPACE_ID}`);
+      handleFirestoreError(err, OperationType.CREATE, `workspaces/${targetWorkspaceId}`);
     }
 
     await migrateSnapshotToWorkspace(
@@ -1770,13 +1812,13 @@ export async function bootstrapOrJoinWorkspace(
         memberUids: [uid],
         adminUids: [uid],
         uid,
-        workspaceId: PRIMARY_WORKSPACE_ID,
+        workspaceId: targetWorkspaceId,
       },
       localSnapshot
     );
 
     return {
-      workspaceId: PRIMARY_WORKSPACE_ID,
+      workspaceId: targetWorkspaceId,
       uid,
       email,
       ...(username ? { username } : {}),
@@ -1827,12 +1869,12 @@ export async function bootstrapOrJoinWorkspace(
         updatedAt: serverTimestamp(),
       });
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `workspaces/${PRIMARY_WORKSPACE_ID}`);
+      handleFirestoreError(err, OperationType.UPDATE, `workspaces/${targetWorkspaceId}`);
     }
   }
 
   // Ensure member doc exists and check active status
-  const memberRef = doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'members', uid);
+  const memberRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'members', uid);
   let roleId: RoleId = isOwner ? 'owner' : 'cashier';
   let assignedStoreIds: string[] = [];
   let staffId: string | undefined;
@@ -1850,7 +1892,7 @@ export async function bootstrapOrJoinWorkspace(
         try {
           const emailHash = await sha256Hex(email);
           const inviteSnap = await getDoc(
-            doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'staffInvites', emailHash)
+            doc(firestoreDb, 'workspaces', targetWorkspaceId, 'staffInvites', emailHash)
           );
           if (inviteSnap.exists()) {
             const inv = inviteSnap.data();
@@ -1926,7 +1968,7 @@ export async function bootstrapOrJoinWorkspace(
     if (err instanceof Error && (err.message.includes('bloklangan') || err.message.includes('faolsizlantirilgan'))) {
       throw err;
     }
-    handleFirestoreError(err, OperationType.WRITE, `workspaces/${PRIMARY_WORKSPACE_ID}/members/${uid}`);
+    handleFirestoreError(err, OperationType.WRITE, `workspaces/${targetWorkspaceId}/members/${uid}`);
   }
 
   const finalIsAdmin = isAdminMember || roleId === 'owner' || roleId === 'admin';
@@ -1942,7 +1984,7 @@ export async function bootstrapOrJoinWorkspace(
   }
 
   return {
-    workspaceId: PRIMARY_WORKSPACE_ID,
+    workspaceId: targetWorkspaceId,
     uid,
     email,
     ...(username ? { username } : {}),
