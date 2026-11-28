@@ -4,7 +4,14 @@ import { useAppStore, uid } from '../store/useAppStore';
 import { formatDateTime, formatMoney, useT } from '../i18n';
 import { Employee, Permission, Role, RoleId } from '../types/models';
 import { exportToExcel } from '../utils/export';
-import { isValidUsername, normalizeUsername, USE_CLOUD_FUNCTIONS } from '../firebase';
+import {
+  AUTH_EMAIL_DOMAIN,
+  isValidLoginIdentifier,
+  loginIdentifierToAuthEmail,
+  loginIdentifierToUsername,
+  normalizeUsername,
+  USE_CLOUD_FUNCTIONS,
+} from '../firebase';
 
 const PERMISSION_GROUPS: { title: string; items: { id: Permission; label: string }[] }[] = [
   {
@@ -161,7 +168,11 @@ export const EmployeesPage: React.FC = () => {
 
   const openEditModal = (emp: Employee) => {
     const linkedUser = db.users.find((u) => u.id === emp.userId);
-    const rawU = emp.username || linkedUser?.username || (emp.email ? emp.email.split('@')[0] : '');
+    const fullEmail = (emp.email || linkedUser?.email || '').trim().toLowerCase();
+    const rawU =
+      fullEmail && !fullEmail.endsWith(`@${AUTH_EMAIL_DOMAIN}`)
+        ? fullEmail
+        : emp.username || linkedUser?.username || (fullEmail ? fullEmail.split('@')[0] : '');
     setEditingEmp(emp);
     setName(emp.name);
     setPhone(emp.phone);
@@ -222,17 +233,24 @@ export const EmployeesPage: React.FC = () => {
       notify("PIN-kod 4–6 ta raqamdan iborat bo'lishi kerak", 'error');
       return;
     }
-    const cleanUsername = normalizeUsername(username);
-    if (!cleanUsername || !isValidUsername(cleanUsername)) {
-      notify("Xodim logini kamida 3 ta lotin harf/raqamdan iborat bo'lishi kerak (masalan: temurr)", 'error');
+    const rawLoginInput = username.trim().toLowerCase().replace(/\s+/g, '');
+    if (!rawLoginInput || !isValidLoginIdentifier(rawLoginInput)) {
+      notify(
+        "Xodim logini kamida 3 ta lotin harf/raqam yoki to'g'ri email bo'lishi kerak (masalan: temurr)",
+        'error'
+      );
       return;
     }
+    const cleanUsername = loginIdentifierToUsername(rawLoginInput);
+    const cleanEmail = loginIdentifierToAuthEmail(rawLoginInput);
+    const editingLinkedUser = editingEmp ? db.users.find((u) => u.id === editingEmp.userId) : undefined;
+    const isEditingUnlinked = Boolean(editingEmp && !(editingEmp.authUid || editingLinkedUser?.authUid));
     const cleanPassword = empPassword.trim();
-    if (!editingEmp && cleanPassword.length < 6) {
-      notify("Yangi xodim paroli kamida 6 ta belgidan iborat bo'lishi kerak", 'error');
+    if ((!editingEmp || isEditingUnlinked) && cleanPassword.length < 6) {
+      notify("Xodim paroli kamida 6 ta belgidan iborat bo'lishi kerak", 'error');
       return;
     }
-    if (editingEmp && cleanPassword && cleanPassword.length < 6) {
+    if (editingEmp && !isEditingUnlinked && cleanPassword && cleanPassword.length < 6) {
       notify("Yangi parol kamida 6 ta belgidan iborat bo'lishi kerak", 'error');
       return;
     }
@@ -244,10 +262,16 @@ export const EmployeesPage: React.FC = () => {
       return;
     }
     const duplicateUsername = db.users.find(
-      (u) => u.id !== targetUserId && normalizeUsername(u.username || '') === cleanUsername
+      (u) =>
+        u.id !== targetUserId &&
+        ((u.email && u.email.trim().toLowerCase() === cleanEmail) ||
+          (!rawLoginInput.includes('@') && normalizeUsername(u.username || '') === cleanUsername))
     );
     if (duplicateUsername) {
-      notify(`Bu login (@${cleanUsername}) ${duplicateUsername.name} ga biriktirilgan! Boshqa login kiriting.`, 'error');
+      notify(
+        `Bu login (@${cleanUsername}) ${duplicateUsername.name} ga biriktirilgan! Boshqa login kiriting.`,
+        'error'
+      );
       return;
     }
 
@@ -271,6 +295,7 @@ export const EmployeesPage: React.FC = () => {
           id: empId,
           userId: targetUserId,
           username: cleanUsername,
+          email: cleanEmail,
           ...(editingEmp?.authUid ? { authUid: editingEmp.authUid } : {}),
           name: name.trim(),
           phone: phone.trim(),
@@ -286,14 +311,15 @@ export const EmployeesPage: React.FC = () => {
         },
         {
           username: cleanUsername,
+          email: cleanEmail,
           pin: cleanPin,
           assignedStoreIds: assignedStoreIds.length ? assignedStoreIds : [primaryStoreId],
           ...(useCustomPerms ? { customPermissions: customPerms } : {}),
         },
         {
           clearCustomPermissions: !useCustomPerms,
-          ...(!editingEmp ? { initialPassword: cleanPassword } : {}),
-          ...(editingEmp && cleanPassword ? { newPassword: cleanPassword } : {}),
+          ...((!editingEmp || isEditingUnlinked) && cleanPassword ? { initialPassword: cleanPassword } : {}),
+          ...(editingEmp && !isEditingUnlinked && cleanPassword ? { newPassword: cleanPassword } : {}),
         }
       );
 
@@ -386,10 +412,14 @@ export const EmployeesPage: React.FC = () => {
                 : db.roles.find((rl) => rl.id === r.emp.roleId)?.permissions.length ?? 0;
 
               const isActiveUser = r.linkedUser ? r.linkedUser.isActive : true;
+              const isCloudLinked = Boolean(r.emp.authUid || r.linkedUser?.authUid);
+              const fullEmail = (r.emp.email || r.linkedUser?.email || '').trim().toLowerCase();
               const displayLogin =
-                r.emp.username ||
-                r.linkedUser?.username ||
-                (r.emp.email || r.linkedUser?.email || '').split('@')[0];
+                fullEmail && !fullEmail.endsWith(`@${AUTH_EMAIL_DOMAIN}`)
+                  ? fullEmail
+                  : r.emp.username ||
+                    r.linkedUser?.username ||
+                    (fullEmail ? fullEmail.split('@')[0] : '');
 
               return (
                 <tr key={r.emp.id} className={`hover:bg-slate-50/60 dark:hover:bg-slate-800/30 ${!isActiveUser ? 'opacity-65' : ''}`}>
@@ -399,6 +429,11 @@ export const EmployeesPage: React.FC = () => {
                       {!isActiveUser && (
                         <span className="px-1.5 py-0.5 rounded-md bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 text-[10px] font-semibold">
                           Bloklangan
+                        </span>
+                      )}
+                      {!isCloudLinked && r.emp.roleId !== 'owner' && (
+                        <span className="px-1.5 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 text-[10px] font-semibold">
+                          Bulutga ulanmagan
                         </span>
                       )}
                       {isCustom && (
@@ -413,7 +448,7 @@ export const EmployeesPage: React.FC = () => {
                     {displayLogin && (
                       <div className="text-[11px] text-teal-700 dark:text-teal-400 font-mono flex items-center gap-1 mt-0.5">
                         <UserIcon className="w-3 h-3 shrink-0" />
-                        <span>@{displayLogin}</span>
+                        <span>{displayLogin.includes('@') ? displayLogin : `@${displayLogin}`}</span>
                       </div>
                     )}
                   </td>
@@ -628,47 +663,63 @@ export const EmployeesPage: React.FC = () => {
                 />
               </div>
 
-              <div>
-                <label className="block text-slate-500 mb-1 font-medium">Login (kirish nomi) *</label>
-                <div className="relative">
-                  <UserIcon className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    required
-                    disabled={Boolean(editingEmp && !USE_CLOUD_FUNCTIONS)}
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/\s+/g, ''))}
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                    placeholder="temurr"
-                    className="w-full h-10 pl-9 pr-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono disabled:opacity-60"
-                  />
-                </div>
-              </div>
+              {(() => {
+                const editingLinkedUser = editingEmp
+                  ? db.users.find((u) => u.id === editingEmp.userId)
+                  : undefined;
+                const isEditingUnlinked = Boolean(
+                  editingEmp && !(editingEmp.authUid || editingLinkedUser?.authUid)
+                );
+                return (
+                  <>
+                    <div>
+                      <label className="block text-slate-500 mb-1 font-medium">Login (yoki Firebase email) *</label>
+                      <div className="relative">
+                        <UserIcon className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          required
+                          disabled={Boolean(editingEmp && !isEditingUnlinked && !USE_CLOUD_FUNCTIONS)}
+                          value={username}
+                          onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/\s+/g, ''))}
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          placeholder="temurr yoki xodim@gmail.com"
+                          className="w-full h-10 pl-9 pr-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono disabled:opacity-60"
+                        />
+                      </div>
+                    </div>
 
-              <div>
-                <label className="block text-slate-500 mb-1 font-medium">
-                  {editingEmp ? 'Yangi parol (ixtiyoriy)' : 'Parol (kamida 6 belgi) *'}
-                </label>
-                <div className="relative">
-                  <input
-                    type={showEmpPw ? 'text' : 'password'}
-                    required={!editingEmp}
-                    value={empPassword}
-                    onChange={(e) => setEmpPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full h-10 pl-3 pr-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowEmpPw((v) => !v)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                    tabIndex={-1}
-                  >
-                    {showEmpPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              </div>
+                    <div>
+                      <label className="block text-slate-500 mb-1 font-medium">
+                        {!editingEmp
+                          ? 'Parol (kamida 6 belgi) *'
+                          : isEditingUnlinked
+                          ? 'Parol (Firebase hisobini ulash uchun) *'
+                          : 'Yangi parol (ixtiyoriy)'}
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showEmpPw ? 'text' : 'password'}
+                          required={!editingEmp || isEditingUnlinked}
+                          value={empPassword}
+                          onChange={(e) => setEmpPassword(e.target.value)}
+                          placeholder="••••••••"
+                          className="w-full h-10 pl-3 pr-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowEmpPw((v) => !v)}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                          tabIndex={-1}
+                        >
+                          {showEmpPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
 
               <div>
                 <label className="block text-slate-500 mb-1 font-medium">PIN-kod (4–6 raqam)</label>
@@ -701,6 +752,10 @@ export const EmployeesPage: React.FC = () => {
                   className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
                 />
               </div>
+            </div>
+
+            <div className="rounded-lg bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 px-3 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+              Bu yerda saqlangan xodim avtomatik ravishda Firebase Authentication va umumiy ish maydoniga biriktiriladi — darhol boshqa telefondan login va parol bilan kira oladi. Agar hisob avval Firebase Console&apos;da ochilgan bo&apos;lsa, o&apos;sha login/email va parolini kiriting.
             </div>
 
             {/* Branch Assignment */}

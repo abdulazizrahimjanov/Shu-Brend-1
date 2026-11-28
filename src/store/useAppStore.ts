@@ -45,14 +45,17 @@ import { Language } from '../i18n';
 import {
   auth,
   authEmailToUsername,
-  createEmployeeAuthSecondary,
   ensureFirestoreNetwork,
   formatFirebaseError,
   isTransientFirestoreError,
+  isValidLoginIdentifier,
   isValidUsername,
+  loginIdentifierToAuthEmail,
+  loginIdentifierToUsername,
   normalizeUsername,
   probeFirestoreConnection,
   resetFirestoreNetwork,
+  signInOrCreateEmployeeAuthSecondary,
   signInWithUsernamePassword,
   signOutFirebase,
   testConnection,
@@ -1536,12 +1539,12 @@ export const useAppStore = create<AppState>((set, get) => {
     loginWithUsername: async (username, password) => {
       const { db, isOnline, language } = get();
       if (!db) return { ok: false, error: "Baza yuklanmadi" };
-      const cleanUsername = normalizeUsername(username);
-      if (!cleanUsername || !isValidUsername(cleanUsername)) {
+      const cleanLoginInput = username.trim().toLowerCase().replace(/\s+/g, '');
+      if (!cleanLoginInput || !isValidLoginIdentifier(cleanLoginInput)) {
         const msg =
           language === 'ru'
-            ? 'Введите корректный логин (минимум 3 латинских символа/цифры).'
-            : "Login kamida 3 ta lotin harf/raqamdan iborat bo'lishi kerak.";
+            ? 'Введите корректный логин или email (минимум 3 символа).'
+            : "Login kamida 3 ta lotin harf/raqam yoki to'g'ri email bo'lishi kerak.";
         set({ cloudError: msg });
         return { ok: false, error: msg };
       }
@@ -1562,7 +1565,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ cloudConnecting: true, cloudError: null });
       interactiveAuthInProgress = true;
       try {
-        const fbUser = await signInWithUsernamePassword(cleanUsername, password);
+        const fbUser = await signInWithUsernamePassword(cleanLoginInput, password);
         const ctx = await connectFirebaseUser(fbUser, {
           forceInteractiveLogin: true,
           setSessionIfMissing: true,
@@ -3707,7 +3710,7 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     upsertEmployee: async (emp, userUpdates, options) => {
-      const { db, isOnline, cloudConnected, workspaceContext, language } = get();
+      const { db, isOnline, language } = get();
       if (!db) return { ok: false, error: 'DB not loaded' };
       if (!get().can('manage_employees')) {
         return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
@@ -3720,54 +3723,90 @@ export const useAppStore = create<AppState>((set, get) => {
       const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
       const existingUser = uIdx >= 0 ? nextDb.users[uIdx] : undefined;
 
-      const rawUsername = userUpdates?.username || emp.username || existingEmp?.username || existingUser?.username || '';
-      const cleanUsername = normalizeUsername(rawUsername);
-      if (cleanUsername && !isValidUsername(cleanUsername)) {
+      const rawLoginInput = (
+        userUpdates?.username ||
+        emp.username ||
+        existingEmp?.username ||
+        existingUser?.username ||
+        ''
+      )
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '');
+      const isEmailLoginInput = rawLoginInput.includes('@');
+      if (rawLoginInput && !isValidLoginIdentifier(rawLoginInput)) {
         return {
           ok: false,
-          error: "Login kamida 3 ta lotin harfi yoki raqamdan iborat bo'lishi kerak (masalan: temurr).",
+          error:
+            "Login kamida 3 ta lotin harfi/raqami yoki to'g'ri email bo'lishi kerak (masalan: temurr).",
         };
       }
-
-      if (cleanUsername) {
-        const dupUser = nextDb.users.find(
-          (u) =>
-            u.id !== emp.userId &&
-            (normalizeUsername(u.username || '') === cleanUsername ||
-              (u.email || '').trim().toLowerCase() === usernameToAuthEmail(cleanUsername))
-        );
-        if (dupUser) {
-          return {
-            ok: false,
-            error: `Bu login (@${cleanUsername}) allaqachon ${dupUser.name} ga biriktirilgan.`,
-          };
-        }
-      }
+      const cleanUsername = rawLoginInput ? loginIdentifierToUsername(rawLoginInput) : '';
 
       const previousEmail = (existingEmp?.email || existingUser?.email || '').trim().toLowerCase() || undefined;
       let resolvedAuthUid = existingEmp?.authUid || existingUser?.authUid || emp.authUid || userUpdates?.authUid;
       let cleanEmail = (
-        (cleanUsername ? usernameToAuthEmail(cleanUsername) : '') ||
-        emp.email ||
-        userUpdates?.email ||
-        existingEmp?.email ||
-        existingUser?.email ||
-        ''
+        (isEmailLoginInput
+          ? loginIdentifierToAuthEmail(rawLoginInput)
+          : emp.email ||
+            userUpdates?.email ||
+            existingEmp?.email ||
+            existingUser?.email ||
+            (cleanUsername ? usernameToAuthEmail(cleanUsername) : ''))
       )
         .trim()
         .toLowerCase();
 
-      // Creating a brand-new employee: provision real Firebase Auth account immediately
-      if (uIdx < 0) {
-        if (!cleanUsername) {
-          return { ok: false, error: 'Yangi xodim uchun login kiriting (masalan: temurr).' };
+      if (cleanUsername || cleanEmail) {
+        const dupUser = nextDb.users.find((u) => {
+          if (u.id === emp.userId) return false;
+          const uEmail = (u.email || '').trim().toLowerCase();
+          const uUser = normalizeUsername(u.username || '');
+          if (cleanEmail && uEmail && uEmail === cleanEmail) return true;
+          if (cleanUsername && uUser && uUser === cleanUsername) {
+            // Two different full emails with same local-part (e.g. ali@gmail.com vs ali@mail.ru) are distinct
+            if (isEmailLoginInput && uEmail && uEmail !== cleanEmail) return false;
+            return true;
+          }
+          return false;
+        });
+        if (dupUser) {
+          return {
+            ok: false,
+            error: `Bu login (@${cleanUsername || cleanEmail}) allaqachon ${dupUser.name} ga biriktirilgan.`,
+          };
         }
-        const initPassword = options?.initialPassword?.trim() || '';
-        if (initPassword.length < 6) {
+      }
+
+      if (!isOnline) {
+        return { ok: false, error: "Xodim yaratish va bulutga ulash uchun internet aloqasi kerak." };
+      }
+
+      // Ensure active cloud workspace connection BEFORE provisioning employee
+      let activeCtx = get().workspaceContext;
+      if ((!get().cloudConnected || !activeCtx) && auth.currentUser) {
+        activeCtx = await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: false });
+      }
+      if (!get().cloudConnected || !activeCtx) {
+        return {
+          ok: false,
+          error:
+            get().cloudError ||
+            "Bulut (Firebase) bilan aloqa faol emas. Sahifani yangilab qayta urinib ko'ring.",
+        };
+      }
+
+      const providedPassword = (options?.initialPassword || options?.newPassword || '').trim();
+
+      // Creating a brand-new employee OR linking an existing unlinked employee:
+      // provision or bind real Firebase Auth account immediately via signInOrCreateEmployeeAuthSecondary
+      if (uIdx < 0 || !resolvedAuthUid) {
+        const authIdentifier = cleanEmail || cleanUsername;
+        if (!authIdentifier) {
+          return { ok: false, error: 'Xodim uchun login yoki email kiriting (masalan: temurr).' };
+        }
+        if (providedPassword.length < 6) {
           return { ok: false, error: "Xodim paroli kamida 6 ta belgidan iborat bo'lishi kerak." };
-        }
-        if (!isOnline) {
-          return { ok: false, error: "Yangi xodim qo'shish uchun internet aloqasi kerak." };
         }
 
         const roleObj = nextDb.roles.find((r) => r.id === emp.roleId);
@@ -3777,11 +3816,11 @@ export const useAppStore = create<AppState>((set, get) => {
             : roleObj?.permissions ?? [...UNIVERSAL_POS_PERMS];
 
         try {
-          if (USE_CLOUD_FUNCTIONS && cloudConnected && workspaceContext) {
+          if (USE_CLOUD_FUNCTIONS) {
             const cfRes = await createEmployeeViaCloudFunction({
-              workspaceId: workspaceContext.workspaceId,
+              workspaceId: activeCtx.workspaceId,
               username: cleanUsername,
-              password: initPassword,
+              password: providedPassword,
               name: emp.name.trim(),
               roleId: emp.roleId,
               assignedStoreIds: userUpdates?.assignedStoreIds?.length
@@ -3795,16 +3834,19 @@ export const useAppStore = create<AppState>((set, get) => {
             }
           }
           if (!resolvedAuthUid) {
-            const created = await createEmployeeAuthSecondary(cleanUsername, initPassword, emp.name.trim());
-            resolvedAuthUid = created.uid;
-            cleanEmail = created.email;
+            const linked = await signInOrCreateEmployeeAuthSecondary(
+              authIdentifier,
+              providedPassword,
+              emp.name.trim()
+            );
+            resolvedAuthUid = linked.uid;
+            cleanEmail = linked.email;
           }
         } catch (err) {
           return { ok: false, error: formatFirebaseError(err, language) };
         }
-      } else if (options?.newPassword?.trim()) {
-        const newPw = options.newPassword.trim();
-        if (newPw.length < 6) {
+      } else if (providedPassword) {
+        if (providedPassword.length < 6) {
           return { ok: false, error: "Yangi parol kamida 6 ta belgidan iborat bo'lishi kerak." };
         }
         const isOwnAccount =
@@ -3812,12 +3854,12 @@ export const useAppStore = create<AppState>((set, get) => {
           (existingUser?.authUid && existingUser.authUid === auth.currentUser?.uid);
         try {
           if (isOwnAccount) {
-            await updateOwnPasswordAuth(newPw);
-          } else if (USE_CLOUD_FUNCTIONS && workspaceContext && resolvedAuthUid) {
+            await updateOwnPasswordAuth(providedPassword);
+          } else if (USE_CLOUD_FUNCTIONS && resolvedAuthUid) {
             await updateEmployeeViaCloudFunction({
-              workspaceId: workspaceContext.workspaceId,
+              workspaceId: activeCtx.workspaceId,
               targetAuthUid: resolvedAuthUid,
-              newPassword: newPw,
+              newPassword: providedPassword,
             });
           } else {
             return {
@@ -3857,9 +3899,6 @@ export const useAppStore = create<AppState>((set, get) => {
           ...existingUser,
           name: emp.name,
           phone: emp.phone,
-          ...(cleanUsername ? { username: cleanUsername } : {}),
-          ...(resolvedAuthUid ? { authUid: resolvedAuthUid } : {}),
-          ...(cleanEmail ? { email: cleanEmail } : {}),
           roleId: emp.roleId,
           ...userUpdates,
           ...(cleanUsername ? { username: cleanUsername } : {}),
@@ -3910,8 +3949,9 @@ export const useAppStore = create<AppState>((set, get) => {
         nextDb.users.push(newUser);
       }
 
-      await syncOrEnqueue(nextDb, {
+      const empSyncOp: OfflineSyncItem = {
         id: uid('sync'),
+        idempotencyKey: uid('sync'),
         type: 'employee',
         payload: {
           empId: emp.id,
@@ -3922,6 +3962,42 @@ export const useAppStore = create<AppState>((set, get) => {
         },
         createdAt: nowIso,
         attempts: 0,
+      };
+      empSyncOp.idempotencyKey = empSyncOp.id;
+
+      // Strictly commit employee access (members/{uid}, staffInvites, invitedEmails, memberUids)
+      // to Firestore before reporting success so employee can sign in immediately from any device.
+      set({ syncStatus: 'syncing' });
+      try {
+        await pushSyncWithTransientRetry(activeCtx, empSyncOp, nextDb, 2);
+      } catch (err) {
+        set({ syncStatus: get().isOnline ? 'online' : 'offline' });
+        return { ok: false, error: formatFirebaseError(err, language) };
+      }
+
+      await repository.save(nextDb);
+      const syncedAt = new Date().toISOString();
+      const prevCtx = get().workspaceContext ?? activeCtx;
+      const nextMemberUids =
+        resolvedAuthUid && !prevCtx.memberUids.includes(resolvedAuthUid)
+          ? Array.from(new Set([...prevCtx.memberUids, resolvedAuthUid])).slice(0, 150)
+          : prevCtx.memberUids;
+      const nextInvitedEmails =
+        cleanEmail && !prevCtx.invitedEmails.includes(cleanEmail)
+          ? Array.from(new Set([...prevCtx.invitedEmails, cleanEmail])).slice(0, 150)
+          : prevCtx.invitedEmails;
+
+      set({
+        db: nextDb,
+        workspaceContext: {
+          ...prevCtx,
+          memberUids: nextMemberUids,
+          invitedEmails: nextInvitedEmails,
+        },
+        syncStatus: get().isOnline ? 'online' : 'offline',
+        lastSyncAt: syncedAt,
+        lastSyncCheckAt: syncedAt,
+        cloudError: null,
       });
       return { ok: true };
     },

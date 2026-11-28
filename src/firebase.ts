@@ -122,6 +122,30 @@ export function authEmailToUsername(email?: string | null): string {
   return clean.slice(0, atIdx);
 }
 
+export function isValidEmailAddress(raw: string): boolean {
+  const clean = String(raw || '').trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(clean) && clean.length <= 200;
+}
+
+export function isValidLoginIdentifier(raw: string): boolean {
+  const clean = String(raw || '').trim().toLowerCase();
+  if (!clean) return false;
+  if (clean.includes('@')) return isValidEmailAddress(clean);
+  return isValidUsername(clean);
+}
+
+export function loginIdentifierToAuthEmail(raw: string): string {
+  const clean = String(raw || '').trim().toLowerCase();
+  if (clean.includes('@')) return clean;
+  return usernameToAuthEmail(clean);
+}
+
+export function loginIdentifierToUsername(raw: string): string {
+  const clean = String(raw || '').trim().toLowerCase();
+  if (clean.includes('@')) return normalizeUsername(authEmailToUsername(clean));
+  return normalizeUsername(clean);
+}
+
 export function normalizePhoneDigits(phone: string): string {
   const digits = String(phone || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -419,7 +443,7 @@ export async function signInWithUsernamePassword(
   username: string,
   password: string
 ): Promise<FirebaseUser> {
-  const email = usernameToAuthEmail(username);
+  const email = loginIdentifierToAuthEmail(username);
   const res = await signInWithEmailAndPassword(auth, email, password);
   return res.user;
 }
@@ -450,8 +474,8 @@ export async function createEmployeeAuthSecondary(
   password: string,
   displayName: string
 ): Promise<{ uid: string; email: string; username: string }> {
-  const cleanUsername = normalizeUsername(username);
-  const email = usernameToAuthEmail(cleanUsername);
+  const cleanUsername = loginIdentifierToUsername(username);
+  const email = loginIdentifierToAuthEmail(username);
   const secondaryApp = getSecondaryStaffCreatorApp();
   const secondaryAuth = getAuth(secondaryApp);
   try {
@@ -515,12 +539,19 @@ export async function signInOrCreateEmployeeAuthSecondary(
         ? String((err as { code?: unknown }).code ?? '')
         : '';
     if (code === 'auth/email-already-in-use') {
-      const cleanUsername = normalizeUsername(username);
-      const email = usernameToAuthEmail(cleanUsername);
+      const cleanUsername = loginIdentifierToUsername(username);
+      const email = loginIdentifierToAuthEmail(username);
       const secondaryApp = getSecondaryStaffCreatorApp();
       const secondaryAuth = getAuth(secondaryApp);
       try {
         const cred = await signInWithEmailAndPassword(secondaryAuth, email, password);
+        if (displayName.trim() && !cred.user.displayName) {
+          try {
+            await updateProfile(cred.user, { displayName: displayName.trim() });
+          } catch {
+            // non-fatal
+          }
+        }
         return {
           uid: cred.user.uid,
           email,
@@ -528,7 +559,7 @@ export async function signInOrCreateEmployeeAuthSecondary(
         };
       } catch {
         throw new Error(
-          `Xodim (${cleanUsername}) hisobi allaqachon yaratilgan. O'sha parolni kiriting yoki boshqa login tanlang.`
+          `Xodim (${cleanUsername}) hisobi allaqachon Firebase'da mavjud. Uni ulash uchun o'sha hisobning haqiqiy parolini kiriting yoki boshqa login tanlang.`
         );
       } finally {
         try {

@@ -17,7 +17,7 @@ import { useAppStore } from '../store/useAppStore';
 import { useT } from '../i18n';
 import { PWAInstallButton } from './PWAInstallButton';
 import { checkWorkspaceBootstrapStatus } from '../data/firebaseSync';
-import { isValidUsername, normalizeUsername } from '../firebase';
+import { isValidLoginIdentifier, isValidUsername, normalizeUsername } from '../firebase';
 
 export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCatalog }) => {
   const loginWithUsername = useAppStore((s) => s.loginWithUsername);
@@ -80,12 +80,12 @@ export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCat
     setError('');
     clearCloudError();
 
-    const cleanUser = normalizeUsername(username);
-    if (!cleanUser || !isValidUsername(cleanUser)) {
+    const cleanUser = username.trim().toLowerCase().replace(/\s+/g, '');
+    if (!cleanUser || !isValidLoginIdentifier(cleanUser)) {
       setError(
         language === 'ru'
-          ? 'Введите корректный логин (минимум 3 символа).'
-          : "Login kamida 3 ta lotin harf yoki raqamdan iborat bo'lishi kerak."
+          ? 'Введите корректный логин или email (минимум 3 символа).'
+          : "Login kamida 3 ta lotin harf/raqam yoki to'g'ri email bo'lishi kerak."
       );
       return;
     }

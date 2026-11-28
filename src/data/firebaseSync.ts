@@ -12,6 +12,7 @@ import {
   getDoc,
   getDocs,
   increment,
+  limit,
   onSnapshot,
   query,
   runTransaction,
@@ -1652,7 +1653,7 @@ export async function bootstrapOrJoinWorkspace(
     'Xodim'
   );
 
-  const targetWorkspaceId = await resolveActiveWorkspaceId();
+  let targetWorkspaceId = await resolveActiveWorkspaceId();
 
   // 1. Resolve platform admin record
   let isPlatformAdmin = false;
@@ -1707,19 +1708,59 @@ export async function bootstrapOrJoinWorkspace(
     handleFirestoreError(err, OperationType.WRITE, `userProfiles/${uid}/private/info`);
   }
 
-  // 3. Check primary shared workspace
-  const wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
+  // 3. Check primary shared workspace (with automatic query fallback if user belongs to another workspace)
+  let wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
   let wsSnap;
   try {
     wsSnap = await getDoc(wsRef);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('insufficient')) {
-      throw new Error(
-        "Ushbu xodim hisobi hali umumiy ish maydoniga biriktirilmagan. Admindan Xodimlar bo'limidan ruxsat berishini so'rang."
-      );
+      let recoveredSnap = null;
+      const wsCol = collection(firestoreDb, 'workspaces');
+      const fallbackQueries = [
+        query(wsCol, where('memberUids', 'array-contains', uid), limit(1)),
+        query(wsCol, where('adminUids', 'array-contains', uid), limit(1)),
+        query(wsCol, where('ownerUid', '==', uid), limit(1)),
+        ...(fbUser.email
+          ? [query(wsCol, where('invitedEmails', 'array-contains', fbUser.email), limit(1))]
+          : []),
+        ...(email && email !== fbUser.email
+          ? [query(wsCol, where('invitedEmails', 'array-contains', email), limit(1))]
+          : []),
+      ];
+      for (const fq of fallbackQueries) {
+        try {
+          const qSnap = await getDocs(fq);
+          if (!qSnap.empty) {
+            recoveredSnap = qSnap.docs[0];
+            break;
+          }
+        } catch {
+          // try next query
+        }
+      }
+      if (recoveredSnap) {
+        targetWorkspaceId = recoveredSnap.id;
+        wsRef = doc(firestoreDb, 'workspaces', targetWorkspaceId);
+        wsSnap = recoveredSnap;
+        try {
+          await updateDoc(profileRef, {
+            activeWorkspaceId: targetWorkspaceId,
+            workspaceIds: [targetWorkspaceId],
+            updatedAt: serverTimestamp(),
+          });
+        } catch {
+          // non-fatal
+        }
+      } else {
+        throw new Error(
+          "Ushbu xodim hisobi hali umumiy ish maydoniga biriktirilmagan. Admindan Xodimlar bo'limidan ruxsat berishini so'rang."
+        );
+      }
+    } else {
+      handleFirestoreError(err, OperationType.GET, `workspaces/${targetWorkspaceId}`);
     }
-    handleFirestoreError(err, OperationType.GET, `workspaces/${targetWorkspaceId}`);
   }
 
   // Case A: Workspace does not exist yet -> first authenticated user initializes workspace
@@ -5104,14 +5145,25 @@ export async function pushSyncItemToFirestore(
         const staffId = sanitizeId(emp?.id || user.id);
         const cleanUsername = resolveUserLoginUsername(user, emp);
         const staffAuthUid = String(payload.authUid || emp?.authUid || user.authUid || '').trim();
+        const staffTenantCtx =
+          staffAuthUid && !tenantCtx.memberUids.includes(staffAuthUid)
+            ? {
+                ...tenantCtx,
+                memberUids: Array.from(new Set([...tenantCtx.memberUids, staffAuthUid])).slice(0, 150),
+              }
+            : tenantCtx;
 
         const dirRef = doc(firestoreDb, wsPath, 'staffDirectory', staffId);
         const dirSnap = await getDoc(dirRef);
         const batch = writeBatch(firestoreDb);
-        const dirSer = serializeStaffDirectoryEntry(user, emp, tenantCtx);
+        const dirSer = serializeStaffDirectoryEntry(user, emp, staffTenantCtx);
         if (dirSnap.exists()) {
           const { id: _id, userId: _u, ownerUid: _o, createdBy: _cb, createdAt: _ca, ...updatable } = dirSer;
-          batch.update(dirRef, { ...updatable, updatedAt: serverTimestamp() });
+          batch.update(dirRef, {
+            ...updatable,
+            ...(Array.isArray(user.customPermissions) ? {} : { customPermissions: deleteField() }),
+            updatedAt: serverTimestamp(),
+          });
         } else {
           batch.set(dirRef, dirSer);
         }
@@ -5228,23 +5280,38 @@ export async function pushSyncItemToFirestore(
           let membersChanged = false;
           let nextAdmins = [...liveAdmins];
           let adminsChanged = false;
-          let updatedExistingMember = false;
+          let foundAuthUidMemberDoc = false;
+
+          if (staffAuthUid && !nextMembers.includes(staffAuthUid)) {
+            nextMembers = Array.from(new Set([...nextMembers, staffAuthUid])).slice(0, 150);
+            membersChanged = true;
+          }
+
+          const shouldBeAdmin =
+            Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
 
           membersSnap.docs.forEach((mDoc) => {
             const md = mDoc.data();
-            if (md.staffId === staffId || (staffAuthUid && mDoc.id === staffAuthUid)) {
-              updatedExistingMember = true;
+            const isTargetAuthDoc = Boolean(staffAuthUid && mDoc.id === staffAuthUid);
+            if (isTargetAuthDoc) {
+              foundAuthUidMemberDoc = true;
+            }
+            if (md.staffId === staffId || isTargetAuthDoc) {
+              if (!nextMembers.includes(mDoc.id)) {
+                nextMembers = Array.from(new Set([...nextMembers, mDoc.id])).slice(0, 150);
+                membersChanged = true;
+              }
               batch.update(mDoc.ref, {
+                staffId,
                 displayName: nonEmptyStr(user.name, 120, 'Xodim'),
                 ...(cleanUsername ? { username: cleanUsername } : {}),
                 roleId: user.roleId,
                 assignedStoreIds: user.assignedStoreIds.slice(0, 20),
                 permissions: rulePerms,
                 isActive: Boolean(user.isActive),
+                memberUids: nextMembers,
                 updatedAt: serverTimestamp(),
               });
-              const shouldBeAdmin =
-                Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
               if (shouldBeAdmin && !nextAdmins.includes(mDoc.id)) {
                 nextAdmins = Array.from(new Set([...nextAdmins, mDoc.id])).slice(0, 20);
                 adminsChanged = true;
@@ -5255,16 +5322,13 @@ export async function pushSyncItemToFirestore(
             }
           });
 
-          // If new employee was just created with Firebase Auth UID, pre-provision members/{authUid} immediately
-          if (!updatedExistingMember && staffAuthUid) {
-            if (!nextMembers.includes(staffAuthUid)) {
-              nextMembers = Array.from(new Set([...nextMembers, staffAuthUid])).slice(0, 150);
-              membersChanged = true;
-            }
-            const shouldBeAdmin =
-              Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
+          // Ensure members/{staffAuthUid} always exists when Firebase Auth UID is known
+          if (staffAuthUid && !foundAuthUidMemberDoc) {
             if (shouldBeAdmin && !nextAdmins.includes(staffAuthUid)) {
               nextAdmins = Array.from(new Set([...nextAdmins, staffAuthUid])).slice(0, 20);
+              adminsChanged = true;
+            } else if (!shouldBeAdmin && staffAuthUid !== ctx.ownerUid && nextAdmins.includes(staffAuthUid)) {
+              nextAdmins = nextAdmins.filter((uid) => uid !== staffAuthUid);
               adminsChanged = true;
             }
             batch.set(doc(firestoreDb, wsPath, 'members', staffAuthUid), {
