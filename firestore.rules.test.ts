@@ -702,6 +702,92 @@ export async function runEmulatorSecurityTests(): Promise<{ passed: number; fail
         }),
       );
     });
+
+    // 6. Active staff can create non-admin employees and sync invites/members/workspaces without privilege escalation
+    await check('Active staff CAN create non-admin employee across directory/invites/members/workspace, CANNOT escalate to admin/owner', async () => {
+      const NEW_EMP_UID = 'uid-new-cashier-1';
+      const NEW_EMP_EMAIL_HASH = 'a'.repeat(64);
+      const nextMembers = [...ALL_MEMBERS, NEW_EMP_UID];
+
+      const batch = torDb.batch();
+      batch.set(torDb.doc(`workspaces/${WS_ID}/staffDirectory/emp-new-1`), {
+        id: 'emp-new-1',
+        userId: 'usr-new-1',
+        username: 'temur2',
+        authUid: NEW_EMP_UID,
+        name: 'Temur 2',
+        roleId: 'cashier',
+        assignedStoreIds: [STORE_TOR],
+        isActive: true,
+        schedule: '2/2 smena',
+        storeId: STORE_TOR,
+        ownerUid: OWNER_UID,
+        memberUids: [...nextMembers],
+        createdBy: TOR_UID,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+      batch.set(torDb.doc(`workspaces/${WS_ID}/staffInvites/${NEW_EMP_EMAIL_HASH}`), {
+        id: NEW_EMP_EMAIL_HASH,
+        staffId: 'emp-new-1',
+        userId: 'usr-new-1',
+        roleId: 'cashier',
+        assignedStoreIds: [STORE_TOR],
+        permissions: ['sell', 'view_catalog', 'view_customers', 'manage_customers', 'manage_employees'],
+        ownerUid: OWNER_UID,
+        adminUids: [OWNER_UID],
+        createdBy: TOR_UID,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+      batch.set(torDb.doc(`workspaces/${WS_ID}/members/${NEW_EMP_UID}`), {
+        uid: NEW_EMP_UID,
+        staffId: 'emp-new-1',
+        username: 'temur2',
+        displayName: 'Temur 2',
+        roleId: 'cashier',
+        assignedStoreIds: [STORE_TOR],
+        permissions: ['sell', 'view_catalog', 'view_customers', 'manage_customers', 'manage_employees'],
+        isActive: true,
+        ownerUid: OWNER_UID,
+        memberUids: [...nextMembers],
+        createdAt: ts,
+        updatedAt: ts,
+      });
+      batch.update(torDb.doc(`workspaces/${WS_ID}`), {
+        invitedEmails: [OWNER_EMAIL, 'toraqorgon@shubrend.uz', 'mingbuloq@shubrend.uz', 'temur2@users.shubrend.uz'],
+        memberUids: [...nextMembers],
+        updatedAt: ts,
+      });
+      await assertSucceeds(batch.commit());
+
+      // Still CANNOT create an admin employee or modify owner
+      await assertFails(
+        torDb.doc(`workspaces/${WS_ID}/staffDirectory/emp-evil-admin`).set({
+          id: 'emp-evil-admin',
+          userId: 'usr-evil-admin',
+          username: 'eviladmin',
+          authUid: 'uid-evil-admin',
+          name: 'Evil Admin',
+          roleId: 'admin',
+          assignedStoreIds: [STORE_TOR],
+          isActive: true,
+          schedule: '2/2 smena',
+          storeId: STORE_TOR,
+          ownerUid: OWNER_UID,
+          memberUids: [...ALL_MEMBERS, 'uid-evil-admin'],
+          createdBy: TOR_UID,
+          createdAt: ts,
+          updatedAt: ts,
+        }),
+      );
+      await assertFails(
+        torDb.doc(`workspaces/${WS_ID}/members/${NEW_EMP_UID}`).update({
+          roleId: 'admin',
+          updatedAt: ts,
+        }),
+      );
+    });
   } finally {
     await testEnv.cleanup();
   }

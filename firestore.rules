@@ -1045,7 +1045,24 @@ service cloud.firestore {
         (isCreate ? hasAdminTenantFields(data) : hasAdminTenantFieldsUpdate(data));
     }
 
-    function isValidStaffInvite(data, inviteId, isCreate) {
+    function hasStaffInviteTenantFields(data, workspaceId, isCreate) {
+      return data.ownerUid is string &&
+        data.ownerUid == (isCreate ? wsDoc(workspaceId).data.ownerUid : existing().ownerUid) &&
+        data.adminUids is list &&
+        data.adminUids.size() >= 1 &&
+        data.adminUids.size() <= 20 &&
+        data.adminUids[0] is string &&
+        data.ownerUid in data.adminUids &&
+        data.createdBy is string &&
+        data.createdBy.size() >= 1 &&
+        data.createdBy.size() <= 128 &&
+        (isCreate
+          ? (data.createdAt == request.time && data.updatedAt == request.time)
+          : (data.createdBy == existing().createdBy && data.createdAt == existing().createdAt && data.updatedAt == request.time)
+        );
+    }
+
+    function isValidStaffInvite(data, inviteId, isCreate, workspaceId) {
       return data.keys().hasAll([
           'id', 'staffId', 'userId', 'roleId', 'assignedStoreIds',
           'permissions', 'ownerUid', 'adminUids', 'createdBy',
@@ -1062,7 +1079,7 @@ service cloud.firestore {
         data.roleId is string && data.roleId.size() >= 1 && data.roleId.size() <= 64 &&
         data.assignedStoreIds is list && data.assignedStoreIds.size() <= 20 && (data.assignedStoreIds.size() == 0 || data.assignedStoreIds[0] is string) &&
         data.permissions is list && data.permissions.size() <= 30 && (data.permissions.size() == 0 || data.permissions[0] is string) &&
-        (isCreate ? hasAdminTenantFields(data) : hasAdminTenantFieldsUpdate(data));
+        hasStaffInviteTenantFields(data, workspaceId, isCreate);
     }
 
     function isValidTarget(data, targetId, isCreate) {
@@ -1251,6 +1268,15 @@ service cloud.firestore {
             incoming().memberUids.hasAll(existing().memberUids) &&
             incoming().memberUids.size() <= existing().memberUids.size() + 1 &&
             request.auth.uid in incoming().memberUids
+          ) ||
+          // Action: Active workspace member invites/registers new staff (append-only memberUids & invitedEmails)
+          (
+            isActiveWsMember(workspaceId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'invitedEmails', 'updatedAt']) &&
+            incoming().memberUids.hasAll(existing().memberUids) &&
+            incoming().invitedEmails.hasAll(existing().invitedEmails) &&
+            incoming().memberUids.size() <= existing().memberUids.size() + 2 &&
+            incoming().invitedEmails.size() <= existing().invitedEmails.size() + 2
           )
         );
       allow delete: if isVerified() && isValidId(workspaceId) && (
@@ -1262,7 +1288,7 @@ service cloud.firestore {
         allow get: if isVerified() && isValidId(workspaceId) && isValidId(memberUid) && (
           isPlatformAdmin() ||
           isWsAdminRead(workspaceId) ||
-          (isWsMemberRead(workspaceId) && request.auth.uid == memberUid)
+          (isWsMemberRead(workspaceId) && (request.auth.uid == memberUid || hasActiveMemberRecord(workspaceId)))
         );
         allow list: if isVerified() && isValidId(workspaceId) && (
           isPlatformAdmin() ||
@@ -1280,7 +1306,14 @@ service cloud.firestore {
               wsDoc(workspaceId).data.ownerUid == request.auth.uid
             ) ||
             isWsAdmin(workspaceId) ||
-            // Invited employee self-registering using verified admin-issued staffInvites binding
+            // Active workspace member registering a new non-admin employee
+            (
+              isActiveWsMember(workspaceId) &&
+              memberUid != request.auth.uid &&
+              memberUid != wsDoc(workspaceId).data.ownerUid &&
+              !(incoming().roleId in ['owner', 'admin'])
+            ) ||
+            // Invited employee self-registering using verified staffInvites binding
             (
               memberUid == request.auth.uid &&
               isInvitedEmail(wsDoc(workspaceId).data.invitedEmails) &&
@@ -1298,7 +1331,7 @@ service cloud.firestore {
                   !exists(/databases/$(database)/documents/workspaces/$(workspaceId)/staffInvites/$(authEmailSha256())) &&
                   !(incoming().roleId in ['owner', 'admin']) &&
                   incoming().assignedStoreIds.size() >= 1 &&
-                  incoming().permissions.hasOnly(['sell', 'view_catalog', 'view_customers', 'manage_customers', 'refund', 'manage_stock', 'manage_products', 'manage_marketing']) &&
+                  incoming().permissions.hasOnly(['sell', 'view_catalog', 'view_customers', 'manage_customers', 'refund', 'manage_stock', 'manage_products', 'manage_marketing', 'manage_employees']) &&
                   incoming().isActive == true
                 )
               )
@@ -1308,14 +1341,29 @@ service cloud.firestore {
           isValidWorkspaceMemberBase(incoming(), memberUid) &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          incoming().ownerUid == existing().ownerUid &&
-          isWsAdmin(workspaceId) && (
+          incoming().ownerUid == existing().ownerUid && (
+            isWsAdmin(workspaceId) ||
+            (
+              isActiveWsMember(workspaceId) &&
+              memberUid != request.auth.uid &&
+              memberUid != wsDoc(workspaceId).data.ownerUid &&
+              !(existing().roleId in ['owner', 'admin']) &&
+              !(incoming().roleId in ['owner', 'admin'])
+            )
+          ) && (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'staffId', 'username', 'displayName', 'roleId', 'assignedStoreIds', 'permissions', 'isActive', 'memberUids', 'updatedAt'
             ])
           );
         allow delete: if isVerified() && isValidId(workspaceId) && isValidId(memberUid) &&
-          isWsAdmin(workspaceId) && memberUid != wsDoc(workspaceId).data.ownerUid;
+          memberUid != wsDoc(workspaceId).data.ownerUid && (
+            isWsAdmin(workspaceId) ||
+            (
+              isActiveWsMember(workspaceId) &&
+              memberUid != request.auth.uid &&
+              (resource == null || !(existing().roleId in ['owner', 'admin']))
+            )
+          );
       }
 
       // 6b. Admin-Only Integration Secrets
@@ -1781,17 +1829,28 @@ service cloud.firestore {
         allow list: if canReadWorkspaceRow(workspaceId, resource.data);
         allow create: if isVerified() && isValidId(workspaceId) && isValidId(staffId) &&
           isValidStaffDirectoryEntry(incoming(), staffId, true) &&
-          incoming().ownerUid == wsDoc(workspaceId).data.ownerUid &&
-          isWsAdmin(workspaceId);
+          incoming().ownerUid == wsDoc(workspaceId).data.ownerUid && (
+            isWsAdmin(workspaceId) ||
+            (isActiveWsMember(workspaceId) && !(incoming().roleId in ['owner', 'admin']))
+          );
         allow update: if isVerified() && isValidId(workspaceId) && isValidId(staffId) &&
-          isValidStaffDirectoryEntry(incoming(), staffId, false) &&
-          isWsAdmin(workspaceId) && (
+          isValidStaffDirectoryEntry(incoming(), staffId, false) && (
+            isWsAdmin(workspaceId) ||
+            (
+              isActiveWsMember(workspaceId) &&
+              !(existing().roleId in ['owner', 'admin']) &&
+              !(incoming().roleId in ['owner', 'admin'])
+            )
+          ) && (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'username', 'authUid', 'name', 'roleId', 'assignedStoreIds', 'customPermissions', 'isActive',
               'avatarColor', 'schedule', 'storeId', 'memberUids', 'updatedAt'
             ])
           );
-        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(staffId) && isWsAdmin(workspaceId);
+        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(staffId) && (
+          isWsAdmin(workspaceId) ||
+          (isActiveWsMember(workspaceId) && (resource == null || !(existing().roleId in ['owner', 'admin'])))
+        );
       }
 
       match /staffCredentials/{staffId} {
@@ -1826,6 +1885,7 @@ service cloud.firestore {
       match /staffInvites/{inviteId} {
         allow get: if isVerified() && isValidId(workspaceId) && isValidId(inviteId) && (
           isWsAdminRead(workspaceId) ||
+          (isWsMemberRead(workspaceId) && hasActiveMemberRecord(workspaceId)) ||
           (
             isWsMemberRead(workspaceId) &&
             'email' in request.auth.token &&
@@ -1835,17 +1895,27 @@ service cloud.firestore {
         );
         allow list: if canReadAdminRow(workspaceId, resource.data);
         allow create: if isVerified() && isValidId(workspaceId) && isValidId(inviteId) &&
-          isValidStaffInvite(incoming(), inviteId, true) &&
-          hasAdminTenantFieldsForWs(incoming(), workspaceId) &&
-          isWsAdmin(workspaceId);
+          isValidStaffInvite(incoming(), inviteId, true, workspaceId) && (
+            isWsAdmin(workspaceId) ||
+            (isActiveWsMember(workspaceId) && !(incoming().roleId in ['owner', 'admin']))
+          );
         allow update: if isVerified() && isValidId(workspaceId) && isValidId(inviteId) &&
-          isValidStaffInvite(incoming(), inviteId, false) &&
-          isWsAdmin(workspaceId) && (
+          isValidStaffInvite(incoming(), inviteId, false, workspaceId) && (
+            isWsAdmin(workspaceId) ||
+            (
+              isActiveWsMember(workspaceId) &&
+              !(existing().roleId in ['owner', 'admin']) &&
+              !(incoming().roleId in ['owner', 'admin'])
+            )
+          ) && (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'staffId', 'userId', 'roleId', 'assignedStoreIds', 'permissions', 'adminUids', 'updatedAt'
             ])
           );
-        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(inviteId) && isWsAdmin(workspaceId);
+        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(inviteId) && (
+          isWsAdmin(workspaceId) ||
+          (isActiveWsMember(workspaceId) && (resource == null || !(existing().roleId in ['owner', 'admin'])))
+        );
       }
 
       match /targets/{targetId} {
@@ -1857,10 +1927,10 @@ service cloud.firestore {
           isActiveWsMember(workspaceId);
         allow update: if isVerified() && isValidId(workspaceId) && isValidId(targetId) &&
           isValidTarget(incoming(), targetId, false) &&
-          isWsAdmin(workspaceId) && (
+          isActiveWsMember(workspaceId) && (
             incoming().diff(existing()).affectedKeys().hasOnly(['employeeId', 'month', 'targetAmount', 'memberUids', 'updatedAt'])
           );
-        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(targetId) && isWsAdmin(workspaceId);
+        allow delete: if isVerified() && isValidId(workspaceId) && isValidId(targetId) && isActiveWsMember(workspaceId);
       }
 
       // 6j. Online Orders, Audit Logs & Idempotent Offline Sync Markers

@@ -985,7 +985,7 @@ function serializeStaffCredential(
     hiredAt: clampStr(emp?.hiredAt || user.createdAt || new Date().toISOString(), 64),
     storeId: nonEmptyStr(emp?.storeId || user.storeId, 128, 'store-chilonzor'),
     ownerUid: ctx.ownerUid,
-    adminUids: Array.from(new Set([ctx.ownerUid, ...ctx.adminUids])).slice(0, 20),
+    adminUids: Array.from(new Set([ctx.ownerUid, ...ctx.adminUids, ctx.uid])).slice(0, 20),
     createdBy: ctx.uid,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -2010,6 +2010,46 @@ export async function bootstrapOrJoinWorkspace(
       throw err;
     }
     handleFirestoreError(err, OperationType.WRITE, `workspaces/${targetWorkspaceId}/members/${uid}`);
+  }
+
+  // Auto-ensure staffDirectory entry exists for joined employee (e.g. added via Firebase Console)
+  if (staffId) {
+    try {
+      const cleanDirId = sanitizeId(staffId);
+      const dirRef = doc(firestoreDb, 'workspaces', targetWorkspaceId, 'staffDirectory', cleanDirId);
+      const dirSnap = await getDoc(dirRef);
+      if (!dirSnap.exists()) {
+        const defaultStoreId =
+          assignedStoreIds[0] ||
+          localSnapshot.stores[0]?.id ||
+          'store-chilonzor';
+        const effectiveStores =
+          assignedStoreIds.length > 0
+            ? assignedStoreIds.slice(0, 20)
+            : localSnapshot.stores.length > 0
+            ? localSnapshot.stores.map((s) => s.id).filter(Boolean).slice(0, 20)
+            : [defaultStoreId];
+        await setDoc(dirRef, {
+          id: cleanDirId,
+          userId: sanitizeId(staffUserId || cleanDirId),
+          ...(username ? { username: clampStr(username, 64) } : {}),
+          authUid: uid,
+          name: displayName,
+          roleId,
+          assignedStoreIds: effectiveStores,
+          isActive: true,
+          schedule: '2/2 smena, 09:00–21:00',
+          storeId: defaultStoreId,
+          ownerUid,
+          memberUids: Array.from(new Set([ownerUid, uid, ...memberUids])).slice(0, 150),
+          createdBy: uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch {
+      // non-fatal: membership & login still succeed
+    }
   }
 
   const finalIsAdmin = isAdminMember || roleId === 'owner' || roleId === 'admin';
@@ -3252,6 +3292,8 @@ export function subscribeWorkspaceRealtime(
                       'view_catalog',
                       'view_customers',
                       'manage_customers',
+                      'view_employees',
+                      'manage_employees',
                     ])
                   ),
                 }
@@ -3286,6 +3328,23 @@ export function subscribeWorkspaceRealtime(
             createdBy: String(dir.createdBy || ctx.ownerUid),
           };
           nextEmployees.push(mergedEmp);
+        });
+
+        // Preserve recently created/updated local employees while staffDirectory listener catches up
+        const nowMs = Date.now();
+        base.employees.forEach((localEmp) => {
+          const updatedMs = Date.parse(localEmp.updatedAt || '');
+          if (
+            Number.isFinite(updatedMs) &&
+            nowMs - updatedMs < 8000 &&
+            !nextEmployees.some((e) => e.id === localEmp.id)
+          ) {
+            nextEmployees.unshift(localEmp);
+            const localUser = base.users.find((u) => u.id === localEmp.userId);
+            if (localUser && !nextUsers.some((u) => u.id === localUser.id)) {
+              nextUsers.push(localUser);
+            }
+          }
         });
 
         if (nextUsers.length > 0) {
@@ -5142,16 +5201,23 @@ export async function pushSyncItemToFirestore(
         const emp = snapshot.employees.find((e) => e.id === empId);
         const user = snapshot.users.find((u) => u.id === (emp?.userId || String(payload.userId || '')));
         if (!user) return;
+        if (!ctx.isWsAdmin && (user.roleId === 'owner' || user.roleId === 'admin')) {
+          throw new BusinessRuleError("Egasi yoki Administrator hisobini faqat administrator o'zgartira oladi.");
+        }
         const staffId = sanitizeId(emp?.id || user.id);
         const cleanUsername = resolveUserLoginUsername(user, emp);
         const staffAuthUid = String(payload.authUid || emp?.authUid || user.authUid || '').trim();
-        const staffTenantCtx =
-          staffAuthUid && !tenantCtx.memberUids.includes(staffAuthUid)
-            ? {
-                ...tenantCtx,
-                memberUids: Array.from(new Set([...tenantCtx.memberUids, staffAuthUid])).slice(0, 150),
-              }
-            : tenantCtx;
+        const staffTenantCtx = {
+          ...tenantCtx,
+          memberUids: Array.from(
+            new Set([
+              tenantCtx.ownerUid,
+              tenantCtx.uid,
+              ...tenantCtx.memberUids,
+              ...(staffAuthUid ? [staffAuthUid] : []),
+            ])
+          ).slice(0, 150),
+        };
 
         const dirRef = doc(firestoreDb, wsPath, 'staffDirectory', staffId);
         const dirSnap = await getDoc(dirRef);
@@ -5168,6 +5234,7 @@ export async function pushSyncItemToFirestore(
           batch.set(dirRef, dirSer);
         }
 
+        // PII & hashed credential record remains admin-only
         if (ctx.isWsAdmin) {
           const credRef = doc(firestoreDb, wsPath, 'staffCredentials', staffId);
           const credSnap = await getDoc(credRef);
@@ -5194,64 +5261,70 @@ export async function pushSyncItemToFirestore(
           } else {
             batch.set(credRef, credSer);
           }
+        }
 
-          const activeEmailsForStaff = getStaffEmails(user, emp);
+        // Sync staffInvites, members/{uid}, and workspace memberUids/invitedEmails for ALL authorized staff creators
+        const activeEmailsForStaff = getStaffEmails(user, emp);
+        const prevEmail =
+          typeof payload.previousEmail === 'string' && payload.previousEmail
+            ? normalizeEmailValue(payload.previousEmail)
+            : '';
+        const prevEmails = prevEmail ? [prevEmail] : [];
 
-          const prevEmail =
-            typeof payload.previousEmail === 'string' && payload.previousEmail
-              ? normalizeEmailValue(payload.previousEmail)
-              : '';
-          const prevEmails = prevEmail ? [prevEmail] : [];
+        const inviteAdminList = ctx.isWsAdmin
+          ? Array.from(new Set([ctx.ownerUid, ...ctx.adminUids, ctx.uid]))
+          : Array.from(new Set([ctx.ownerUid, ...ctx.adminUids]));
 
-          for (const targetEmail of activeEmailsForStaff) {
-            const emailHash = await sha256Hex(targetEmail);
-            const invRef = doc(firestoreDb, wsPath, 'staffInvites', emailHash);
-            const invSnap = await getDoc(invRef);
-            const invSer = serializeStaffInvite(
-              user,
-              emp,
-              snapshot.roles,
-              { ownerUid: ctx.ownerUid, adminUids: ctx.adminUids, uid: ctx.uid },
-              emailHash
-            );
-            if (invSnap.exists()) {
-              batch.update(invRef, {
-                staffId: invSer.staffId,
-                userId: invSer.userId,
-                roleId: invSer.roleId,
-                assignedStoreIds: invSer.assignedStoreIds,
-                permissions: invSer.permissions,
-                adminUids: invSer.adminUids,
-                updatedAt: serverTimestamp(),
-              });
-            } else {
-              batch.set(invRef, invSer);
-            }
+        for (const targetEmail of activeEmailsForStaff) {
+          const emailHash = await sha256Hex(targetEmail);
+          const invRef = doc(firestoreDb, wsPath, 'staffInvites', emailHash);
+          const invSnap = await getDoc(invRef);
+          const invSer = serializeStaffInvite(
+            user,
+            emp,
+            snapshot.roles,
+            { ownerUid: ctx.ownerUid, adminUids: inviteAdminList, uid: ctx.uid },
+            emailHash
+          );
+          if (invSnap.exists()) {
+            batch.update(invRef, {
+              staffId: invSer.staffId,
+              userId: invSer.userId,
+              roleId: invSer.roleId,
+              assignedStoreIds: invSer.assignedStoreIds,
+              permissions: invSer.permissions,
+              adminUids: invSer.adminUids,
+              updatedAt: serverTimestamp(),
+            });
+          } else {
+            batch.set(invRef, invSer);
           }
+        }
 
-          for (const oldEmail of prevEmails) {
-            if (!activeEmailsForStaff.includes(oldEmail)) {
-              const oldHash = await sha256Hex(oldEmail);
-              batch.delete(doc(firestoreDb, wsPath, 'staffInvites', oldHash));
-            }
+        for (const oldEmail of prevEmails) {
+          if (!activeEmailsForStaff.includes(oldEmail)) {
+            const oldHash = await sha256Hex(oldEmail);
+            batch.delete(doc(firestoreDb, wsPath, 'staffInvites', oldHash));
           }
+        }
 
-          const wsRef = doc(firestoreDb, 'workspaces', ctx.workspaceId);
-          const wsSnap = await getDoc(wsRef);
-          const wsData = wsSnap.data();
-          const liveInvited = Array.isArray(wsData?.invitedEmails)
-            ? (wsData.invitedEmails as string[]).map((e) => String(e).toLowerCase())
-            : ctx.invitedEmails;
-          const liveMembers = Array.isArray(wsData?.memberUids)
-            ? (wsData.memberUids as string[]).map((u) => String(u))
-            : ctx.memberUids;
-          const liveAdmins = Array.isArray(wsData?.adminUids)
-            ? (wsData.adminUids as string[]).map((u) => String(u))
-            : ctx.adminUids;
+        const wsRef = doc(firestoreDb, 'workspaces', ctx.workspaceId);
+        const wsSnap = await getDoc(wsRef);
+        const wsData = wsSnap.data();
+        const liveInvited = Array.isArray(wsData?.invitedEmails)
+          ? (wsData.invitedEmails as string[]).map((e) => String(e).toLowerCase())
+          : ctx.invitedEmails;
+        const liveMembers = Array.isArray(wsData?.memberUids)
+          ? (wsData.memberUids as string[]).map((u) => String(u))
+          : ctx.memberUids;
+        const liveAdmins = Array.isArray(wsData?.adminUids)
+          ? (wsData.adminUids as string[]).map((u) => String(u))
+          : ctx.adminUids;
 
-          let nextInvited = [...liveInvited];
-          let invitedChanged = false;
+        let nextInvited = [...liveInvited];
+        let invitedChanged = false;
 
+        if (ctx.isWsAdmin) {
           for (const oldEmail of prevEmails) {
             if (!activeEmailsForStaff.includes(oldEmail)) {
               const stillUsed =
@@ -5263,32 +5336,35 @@ export async function pushSyncItemToFirestore(
               }
             }
           }
-          for (const targetEmail of activeEmailsForStaff) {
-            if (!nextInvited.includes(targetEmail)) {
-              nextInvited = Array.from(new Set([...nextInvited, targetEmail])).slice(0, 150);
-              invitedChanged = true;
-            }
+        }
+        for (const targetEmail of activeEmailsForStaff) {
+          if (!nextInvited.includes(targetEmail)) {
+            nextInvited = Array.from(new Set([...nextInvited, targetEmail])).slice(0, 150);
+            invitedChanged = true;
           }
+        }
 
+        const rolePerms =
+          user.customPermissions ??
+          snapshot.roles.find((r) => r.id === user.roleId)?.permissions ??
+          [];
+        const rulePerms = mapAppPermissionsToRuleTokens(rolePerms, user.roleId);
+        let nextMembers = [...liveMembers];
+        let membersChanged = false;
+        let nextAdmins = [...liveAdmins];
+        let adminsChanged = false;
+
+        if (staffAuthUid && !nextMembers.includes(staffAuthUid)) {
+          nextMembers = Array.from(new Set([...nextMembers, staffAuthUid])).slice(0, 150);
+          membersChanged = true;
+        }
+
+        const shouldBeAdmin =
+          Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
+
+        if (ctx.isWsAdmin) {
           const membersSnap = await getDocs(collection(firestoreDb, wsPath, 'members'));
-          const rolePerms =
-            user.customPermissions ??
-            snapshot.roles.find((r) => r.id === user.roleId)?.permissions ??
-            [];
-          const rulePerms = mapAppPermissionsToRuleTokens(rolePerms, user.roleId);
-          let nextMembers = [...liveMembers];
-          let membersChanged = false;
-          let nextAdmins = [...liveAdmins];
-          let adminsChanged = false;
           let foundAuthUidMemberDoc = false;
-
-          if (staffAuthUid && !nextMembers.includes(staffAuthUid)) {
-            nextMembers = Array.from(new Set([...nextMembers, staffAuthUid])).slice(0, 150);
-            membersChanged = true;
-          }
-
-          const shouldBeAdmin =
-            Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
 
           membersSnap.docs.forEach((mDoc) => {
             const md = mDoc.data();
@@ -5322,7 +5398,6 @@ export async function pushSyncItemToFirestore(
             }
           });
 
-          // Ensure members/{staffAuthUid} always exists when Firebase Auth UID is known
           if (staffAuthUid && !foundAuthUidMemberDoc) {
             if (shouldBeAdmin && !nextAdmins.includes(staffAuthUid)) {
               nextAdmins = Array.from(new Set([...nextAdmins, staffAuthUid])).slice(0, 20);
@@ -5346,7 +5421,40 @@ export async function pushSyncItemToFirestore(
               updatedAt: serverTimestamp(),
             });
           }
+        } else if (staffAuthUid && staffAuthUid !== ctx.ownerUid && staffAuthUid !== ctx.uid) {
+          const targetMemberRef = doc(firestoreDb, wsPath, 'members', staffAuthUid);
+          const targetMemberSnap = await getDoc(targetMemberRef);
+          if (targetMemberSnap.exists()) {
+            batch.update(targetMemberRef, {
+              staffId,
+              displayName: nonEmptyStr(user.name, 120, 'Xodim'),
+              ...(cleanUsername ? { username: cleanUsername } : {}),
+              roleId: user.roleId,
+              assignedStoreIds: user.assignedStoreIds.slice(0, 20),
+              permissions: rulePerms,
+              isActive: Boolean(user.isActive),
+              memberUids: nextMembers,
+              updatedAt: serverTimestamp(),
+            });
+          } else {
+            batch.set(targetMemberRef, {
+              uid: staffAuthUid,
+              staffId,
+              ...(cleanUsername ? { username: cleanUsername } : {}),
+              displayName: nonEmptyStr(user.name, 120, 'Xodim'),
+              roleId: user.roleId,
+              assignedStoreIds: user.assignedStoreIds.slice(0, 20),
+              permissions: rulePerms,
+              isActive: Boolean(user.isActive),
+              ownerUid: ctx.ownerUid,
+              memberUids: nextMembers,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
 
+        if (ctx.isWsAdmin) {
           if (invitedChanged || adminsChanged || membersChanged) {
             batch.update(wsRef, {
               ...(invitedChanged ? { invitedEmails: nextInvited } : {}),
@@ -5355,7 +5463,14 @@ export async function pushSyncItemToFirestore(
               updatedAt: serverTimestamp(),
             });
           }
+        } else if (invitedChanged || membersChanged) {
+          batch.update(wsRef, {
+            ...(invitedChanged ? { invitedEmails: nextInvited } : {}),
+            ...(membersChanged ? { memberUids: nextMembers } : {}),
+            updatedAt: serverTimestamp(),
+          });
         }
+
         markSyncedInBatch(batch);
         await batch.commit();
         return;
@@ -5372,13 +5487,13 @@ export async function pushSyncItemToFirestore(
         deletedTargetIds.forEach((tid) => {
           batch.delete(doc(firestoreDb, wsPath, 'targets', sanitizeId(tid)));
         });
+        const emailsToDelete = new Set<string>();
+        if (typeof payload.deletedEmail === 'string' && payload.deletedEmail) {
+          const de = normalizeEmailValue(payload.deletedEmail);
+          if (de) emailsToDelete.add(de);
+        }
         if (ctx.isWsAdmin) {
           const credRef = doc(firestoreDb, wsPath, 'staffCredentials', staffId);
-          const emailsToDelete = new Set<string>();
-          if (typeof payload.deletedEmail === 'string' && payload.deletedEmail) {
-            const de = normalizeEmailValue(payload.deletedEmail);
-            if (de) emailsToDelete.add(de);
-          }
           try {
             const credSnap = await getDoc(credRef);
             if (credSnap.exists()) {
@@ -5440,6 +5555,14 @@ export async function pushSyncItemToFirestore(
             if (Object.keys(wsPatch).length > 0) {
               batch.update(wsRef, { ...wsPatch, updatedAt: serverTimestamp() });
             }
+          }
+        } else {
+          for (const em of emailsToDelete) {
+            const emailHash = await sha256Hex(em);
+            batch.delete(doc(firestoreDb, wsPath, 'staffInvites', emailHash));
+          }
+          if (deletedAuthUid && deletedAuthUid !== ctx.ownerUid && deletedAuthUid !== ctx.uid) {
+            batch.delete(doc(firestoreDb, wsPath, 'members', deletedAuthUid));
           }
         }
         markSyncedInBatch(batch);

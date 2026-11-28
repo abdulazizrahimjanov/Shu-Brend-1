@@ -450,6 +450,8 @@ const UNIVERSAL_POS_PERMS: Permission[] = [
   'view_catalog',
   'view_customers',
   'manage_customers',
+  'view_employees',
+  'manage_employees',
 ];
 
 function matchesSecret(plain: string | undefined, hash: string | undefined, input: string): boolean {
@@ -829,6 +831,34 @@ export const useAppStore = create<AppState>((set, get) => {
       };
       snapshot.users.push(matched);
       mutated = true;
+    }
+
+    if (matched) {
+      const targetEmpId = ctx.staffId || matched.id;
+      const hasEmpRecord = snapshot.employees.some(
+        (e) => e.userId === matched!.id || e.id === targetEmpId
+      );
+      if (!hasEmpRecord) {
+        snapshot.employees.push({
+          id: targetEmpId,
+          userId: matched.id,
+          ...(matched.username ? { username: matched.username } : {}),
+          ...(matched.authUid ? { authUid: matched.authUid } : {}),
+          name: matched.name,
+          phone: matched.phone || '',
+          ...(matched.email ? { email: matched.email } : {}),
+          roleId: matched.roleId,
+          baseSalary: 0,
+          commissionPercent: 0,
+          schedule: '2/2 smena, 09:00–21:00',
+          hiredAt: matched.createdAt,
+          storeId: matched.storeId,
+          createdAt: matched.createdAt,
+          updatedAt: matched.updatedAt,
+          createdBy: matched.createdBy,
+        });
+        mutated = true;
+      }
     }
 
     return { user: matched ?? null, mutatedSnapshot: mutated };
@@ -3716,12 +3746,37 @@ export const useAppStore = create<AppState>((set, get) => {
         return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
       }
       const currentUser = get().getCurrentUser();
+      const actorIsAdmin =
+        currentUser?.roleId === 'owner' ||
+        currentUser?.roleId === 'admin' ||
+        Boolean(get().workspaceContext?.isWsAdmin);
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
       const idx = nextDb.employees.findIndex((e) => e.id === emp.id);
       const existingEmp = idx >= 0 ? nextDb.employees[idx] : undefined;
       const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
       const existingUser = uIdx >= 0 ? nextDb.users[uIdx] : undefined;
+
+      if (!actorIsAdmin) {
+        if (
+          existingEmp?.roleId === 'owner' ||
+          existingUser?.roleId === 'owner' ||
+          existingEmp?.roleId === 'admin' ||
+          existingUser?.roleId === 'admin' ||
+          emp.userId === 'usr-owner'
+        ) {
+          return {
+            ok: false,
+            error: "Egasi yoki Administrator hisobini faqat administrator tahrirlashi mumkin.",
+          };
+        }
+        if (emp.roleId === 'owner' || emp.roleId === 'admin') {
+          return {
+            ok: false,
+            error: "Egasi yoki Administrator rolini faqat administrator biriktira oladi.",
+          };
+        }
+      }
 
       const rawLoginInput = (
         userUpdates?.username ||
@@ -4008,8 +4063,14 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!get().can('manage_employees')) return { ok: false, error: "Ruxsat yo'q" };
       const emp = db.employees.find((e) => e.id === empId);
       if (!emp) return { ok: false, error: 'Xodim topilmadi' };
+      const actor = get().getCurrentUser();
+      const actorIsAdmin =
+        actor?.roleId === 'owner' || actor?.roleId === 'admin' || Boolean(workspaceContext?.isWsAdmin);
       if (emp.roleId === 'owner' || emp.userId === 'usr-owner') {
         return { ok: false, error: "Do'kon egasini bloklab bo'lmaydi" };
+      }
+      if (!actorIsAdmin && emp.roleId === 'admin') {
+        return { ok: false, error: "Administrator hisobini faqat egasi yoki admin bloklashi mumkin" };
       }
       if (emp.userId === currentUserId) {
         return { ok: false, error: "O'z hisobingizni bloklay olmaysiz" };
@@ -4058,8 +4119,14 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!get().can('manage_employees')) return { ok: false, error: "Ruxsat yo'q" };
       const emp = db.employees.find((e) => e.id === empId);
       if (!emp) return { ok: false, error: 'Xodim topilmadi' };
+      const actor = get().getCurrentUser();
+      const actorIsAdmin =
+        actor?.roleId === 'owner' || actor?.roleId === 'admin' || Boolean(workspaceContext?.isWsAdmin);
       if (emp.userId === 'usr-owner' || emp.roleId === 'owner') {
         return { ok: false, error: "Asosiy do'kon egasini o'chirib bo'lmaydi" };
+      }
+      if (!actorIsAdmin && emp.roleId === 'admin') {
+        return { ok: false, error: "Administrator hisobini faqat egasi yoki admin o'chira oladi" };
       }
       if (emp.userId === currentUserId) {
         return { ok: false, error: "Joriy tizimga kirgan o'z hisobingizni o'chira olmaysiz" };
@@ -4572,8 +4639,14 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     updateRolePermissions: async (roleId, permissions) => {
-      const { db } = get();
-      if (!db || (!get().can('manage_settings') && !get().can('manage_employees'))) return;
+      const { db, workspaceContext } = get();
+      const actor = get().getCurrentUser();
+      const isAdminActor =
+        actor?.roleId === 'owner' ||
+        actor?.roleId === 'admin' ||
+        Boolean(workspaceContext?.isWsAdmin) ||
+        get().can('manage_settings');
+      if (!db || !isAdminActor) return;
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const role = nextDb.roles.find((r) => r.id === roleId);
       if (role) {
@@ -4589,10 +4662,16 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     upsertRole: async (role) => {
-      const { db, language } = get();
+      const { db, language, workspaceContext } = get();
       if (!db) return { ok: false, error: 'DB not loaded' };
-      if (!get().can('manage_settings') && !get().can('manage_employees')) {
-        return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
+      const actor = get().getCurrentUser();
+      const isAdminActor =
+        actor?.roleId === 'owner' ||
+        actor?.roleId === 'admin' ||
+        Boolean(workspaceContext?.isWsAdmin) ||
+        get().can('manage_settings');
+      if (!isAdminActor) {
+        return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Faqat administrator rol yarata oladi" };
       }
       const cleanUz = role.nameUz.trim();
       const cleanRu = (role.nameRu || role.nameUz).trim();
@@ -4641,10 +4720,16 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     deleteRole: async (roleId) => {
-      const { db } = get();
+      const { db, workspaceContext } = get();
       if (!db) return { ok: false, error: 'DB not loaded' };
-      if (!get().can('manage_settings') && !get().can('manage_employees')) {
-        return { ok: false, error: "Ruxsat yo'q" };
+      const actor = get().getCurrentUser();
+      const isAdminActor =
+        actor?.roleId === 'owner' ||
+        actor?.roleId === 'admin' ||
+        Boolean(workspaceContext?.isWsAdmin) ||
+        get().can('manage_settings');
+      if (!isAdminActor) {
+        return { ok: false, error: "Faqat administrator rolni o'chira oladi" };
       }
       if (roleId === 'owner') {
         return { ok: false, error: "Egasi (Owner) rolini o'chirib bo'lmaydi" };

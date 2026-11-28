@@ -75,7 +75,8 @@ export const EmployeesPage: React.FC = () => {
   const t = useT();
 
   const canManage = can('manage_employees');
-  const canManageRoles = can('manage_employees') || can('manage_settings');
+  const isOwnerOrAdmin = currentUser?.roleId === 'owner' || currentUser?.roleId === 'admin';
+  const canManageRoles = isOwnerOrAdmin || can('manage_settings');
   const [modalOpen, setModalOpen] = useState(false);
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Employee | null>(null);
@@ -330,16 +331,20 @@ export const EmployeesPage: React.FC = () => {
 
       if (!editingEmp) {
         const now = new Date();
-        await upsertTarget({
-          id: uid('tgt'),
-          employeeId: empId,
-          month: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
-          targetAmount: 30000000,
-          storeId: primaryStoreId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: currentUser?.id ?? 'system',
-        });
+        try {
+          await upsertTarget({
+            id: uid('tgt'),
+            employeeId: empId,
+            month: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`,
+            targetAmount: 30000000,
+            storeId: primaryStoreId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: currentUser?.id ?? 'system',
+          });
+        } catch {
+          // Non-blocking: employee account is already created & synced
+        }
       }
 
       notify(editingEmp ? 'Xodim ma\'lumotlari yangilandi' : "Yangi xodim qo'shildi va Firebase akkaunti yaratildi", 'success');
@@ -481,15 +486,20 @@ export const EmployeesPage: React.FC = () => {
                   {canManage && (
                     <td className="py-3 px-3 text-right whitespace-nowrap">
                       <div className="inline-flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() => openEditModal(r.emp)}
-                          title="Tahrirlash va huquqlar"
-                          className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        {r.emp.roleId !== 'owner' && r.emp.userId !== 'usr-owner' && r.emp.userId !== currentUser?.id && (
+                        {(isOwnerOrAdmin || (r.emp.roleId !== 'owner' && r.emp.roleId !== 'admin' && r.emp.userId !== 'usr-owner')) && (
+                          <button
+                            type="button"
+                            onClick={() => openEditModal(r.emp)}
+                            title="Tahrirlash va huquqlar"
+                            className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        {r.emp.roleId !== 'owner' &&
+                          r.emp.userId !== 'usr-owner' &&
+                          r.emp.userId !== currentUser?.id &&
+                          (isOwnerOrAdmin || r.emp.roleId !== 'admin') && (
                           <>
                             <button
                               type="button"
@@ -624,7 +634,11 @@ export const EmployeesPage: React.FC = () => {
                     className="flex-1 min-w-0 h-10 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
                   >
                     {db.roles
-                      .filter((r) => r.id !== 'owner' || editingEmp?.roleId === 'owner' || editingEmp?.userId === 'usr-owner')
+                      .filter(
+                        (r) =>
+                          (r.id !== 'owner' || editingEmp?.roleId === 'owner' || editingEmp?.userId === 'usr-owner') &&
+                          (r.id !== 'admin' || isOwnerOrAdmin || editingEmp?.roleId === 'admin')
+                      )
                       .map((r) => (
                         <option key={r.id} value={r.id}>
                           {language === 'ru' ? r.nameRu : r.nameUz}
